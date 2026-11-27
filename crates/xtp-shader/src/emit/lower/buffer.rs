@@ -253,7 +253,7 @@ impl<'a> Lower<'a> {
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
-        for &w in bits {
+        for &w in bits.iter().take(channels as usize) {
             let word = words[(at / 32) as usize];
             let field = if w == 32 {
                 word
@@ -296,7 +296,11 @@ impl<'a> Lower<'a> {
                 Numeric::Snorm => {
                     let s = signed(self);
                     let top = (1u32 << (w - 1)) - 1;
-                    let q = if w <= 17 {
+                    let q = if w == 2 {
+                        // Only 0 lies strictly between -1 and 1; the endpoint
+                        // selects below handle >= 1 and <= -1.
+                        self.s.m.f32(0)
+                    } else if w <= 17 {
                         // The magnitude's quotient, signed (codes at and
                         // below -top are -1.0 below).
                         let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
@@ -381,6 +385,12 @@ impl<'a> Lower<'a> {
     /// [`Self::exact_norm`]. The host's conversion of a larger integer is
     /// not relied on: WARP rounds those above 2^31 otherwise.
     fn norm_quotient(&mut self, a: V, w: u32) -> V {
+        debug_assert!((1..=16).contains(&w), "{w}-bit normalized quotient");
+        #[cfg(test)]
+        NORM_QUOTIENTS.with(|n| n.set(n.get() + 1));
+        if w <= 1 {
+            return self.s.m.i32(0);
+        }
         if matches!(w, 11 | 12) {
             return self.exact_norm(a, w);
         }
@@ -431,6 +441,7 @@ impl<'a> Lower<'a> {
     /// formats near 0), then rounded to 24 bits to nearest even with the
     /// remainder as sticky bit, and assembled as float bits.
     fn exact_norm(&mut self, a: V, w: u32) -> V {
+        debug_assert!((2..=16).contains(&w), "{w}-bit exact_norm");
         let c = self.cur;
         let d = (1u64 << w) - 1;
         let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
@@ -1706,6 +1717,8 @@ impl<'a> Lower<'a> {
 thread_local! {
     /// Loads [`Lower::guarded_load`] put under an EXEC guard on this thread.
     static GUARDED_LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Calls to [`Lower::norm_quotient`] on this thread.
+    pub(crate) static NORM_QUOTIENTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

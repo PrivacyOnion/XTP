@@ -6,6 +6,7 @@
 //! `1.0` / `-1.0`).
 
 use super::host::{Dispatch, Host, Root, Stride, View};
+use super::lower::NORM_QUOTIENTS;
 use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, Target, validator};
 use crate::native::{
@@ -17,7 +18,10 @@ const FMT_8_UNORM: u8 = 1;
 const FMT_8_SNORM: u8 = 2;
 const FMT_16_UNORM: u8 = 7;
 const FMT_16_SNORM: u8 = 8;
+const FMT_16_16_UNORM: u8 = 23;
 const FMT_10_11_11_UNORM: u8 = 30;
+const FMT_10_11_11_SNORM: u8 = 31;
+const FMT_10_10_10_2_UNORM: u8 = 44;
 const FMT_10_10_10_2_SNORM: u8 = 45;
 
 /// VOP2 `v_lshlrev_b32 vdst, shift, vsrc1` (`shift` in 0..=64).
@@ -147,12 +151,14 @@ fn all_bytes_packed() -> Vec<u32> {
         .collect()
 }
 
-/// 256 16-bit codes: endpoints, +/-1 boundaries, powers of two, and a spread.
+/// 256 16-bit codes: endpoints, +/-1 boundaries, powers of two (positive and
+/// negative for SNORM), and a spread.
 fn sample_codes_16() -> Vec<u16> {
     let mut codes: Vec<u16> = vec![
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512,
         1023, 1024, 2047, 2048, 4095, 4096, 8191, 8192, 16383, 16384, 32764, 32765, 32766, 32767,
-        32768, 32769, 32770, 32771, 49151, 49152, 65530, 65531, 65532, 65533, 65534, 65535,
+        32768, 32769, 32770, 32771, 49151, 49152, 65280, 65281, 65408, 65409, 65530, 65531, 65532,
+        65533, 65534, 65535,
     ];
     let mut step = 137u16;
     while codes.len() < THREADS as usize {
@@ -204,7 +210,13 @@ fn unorm16_and_snorm16_load_endpoints_and_spread_to_nearest_float() {
     let cs_u16 = build_cs(FMT_16_UNORM, 1, 1, 2);
     run(&cs_u16, &input, THREADS, |l, out| {
         for (i, &c) in codes.iter().enumerate() {
-            assert_eq!(out[i], unorm_bits(u32::from(c), 16), "{l}: 16_UNORM {c}");
+            let got = out[i];
+            assert_eq!(got, unorm_bits(u32::from(c), 16), "{l}: 16_UNORM {c}");
+            assert_eq!(
+                (f32::from_bits(got) * 65535.0) as u32,
+                u32::from(c),
+                "{l}: 16_UNORM trunc {c}"
+            );
         }
     });
     let cs_s16 = build_cs(FMT_16_SNORM, 1, 1, 2);
@@ -214,20 +226,46 @@ fn unorm16_and_snorm16_load_endpoints_and_spread_to_nearest_float() {
             assert_eq!(out[i], snorm_bits(c, 16), "{l}: 16_SNORM {c}");
         }
     });
+    // Two-channel 16_16_UNORM (e.g. endpoints 0 and 65535 in one dword).
+    let input16x2: Vec<u32> = (0..THREADS)
+        .map(|i| {
+            let lo = codes[i as usize];
+            let hi = codes[(THREADS - 1 - i) as usize];
+            u32::from(lo) | (u32::from(hi) << 16)
+        })
+        .collect();
+    let cs_u16x2 = build_cs(FMT_16_16_UNORM, 2, 2, 3);
+    run(&cs_u16x2, &input16x2, THREADS * 2, |l, out| {
+        for (i, &w) in input16x2.iter().enumerate() {
+            assert_eq!(
+                out[i * 2],
+                unorm_bits(w & 0xFFFF, 16),
+                "{l}: 16_16_UNORM ch0 #{i}"
+            );
+            assert_eq!(
+                out[i * 2 + 1],
+                unorm_bits(w >> 16, 16),
+                "{l}: 16_16_UNORM ch1 #{i}"
+            );
+        }
+    });
 }
 
-/// Covers the integer-only `exact_norm` path (11-bit width in `10_11_11_UNORM`)
-/// and 2-bit / 10-bit SNORM channels (`10_10_10_2_SNORM`).
+/// Covers the integer-only `exact_norm` path (all four 11-bit codes `[1, 3, 5, 7]`
+/// that fail without `exact_norm` in `10_11_11_UNORM`), `10_11_11_SNORM`,
+/// `10_10_10_2_UNORM`, and `10_10_10_2_SNORM`.
 #[test]
 fn packed_unorm_and_snorm_formats_load_exact_nearest_floats() {
     let input11: Vec<u32> = (0..THREADS)
         .map(|i| {
-            let x = [0, 1, 2, 7, 8, 1023, 1024, 2046, 2047]
-                .get(i as usize)
-                .copied()
-                .unwrap_or((i * 19) & 0x7FF);
+            let x = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 1023, 1024, 1025, 1026, 2046, 2047,
+            ]
+            .get(i as usize)
+            .copied()
+            .unwrap_or((i * 19) & 0x7FF);
             let y = (2047 - x) & 0x7FF;
-            let z = [0, 1, 1022, 1023]
+            let z = [0, 1, 511, 512, 513, 1022, 1023]
                 .get(i as usize)
                 .copied()
                 .unwrap_or((i * 13) & 0x3FF);
@@ -238,21 +276,46 @@ fn packed_unorm_and_snorm_formats_load_exact_nearest_floats() {
     run(&cs11, &input11, THREADS * 4, |l, out| {
         for (i, &w) in input11.iter().enumerate() {
             let b = i * 4;
-            assert_eq!(out[b], unorm_bits(w & 0x7FF, 11), "{l}: 11b ch0 #{i}");
+            let (c0, c1, c2) = (w & 0x7FF, (w >> 11) & 0x7FF, (w >> 22) & 0x3FF);
+            assert_eq!(out[b], unorm_bits(c0, 11), "{l}: 11b ch0 #{i}");
             assert_eq!(
-                out[b + 1],
-                unorm_bits((w >> 11) & 0x7FF, 11),
-                "{l}: 11b ch1 #{i}"
+                (f32::from_bits(out[b]) * 2047.0) as u32,
+                c0,
+                "{l}: 11b ch0 trunc #{i}"
             );
+            assert_eq!(out[b + 1], unorm_bits(c1, 11), "{l}: 11b ch1 #{i}");
+            assert_eq!(out[b + 2], unorm_bits(c2, 10), "{l}: 10b ch2 #{i}");
             assert_eq!(
-                out[b + 2],
-                unorm_bits((w >> 22) & 0x3FF, 10),
-                "{l}: 10b ch2 #{i}"
+                (f32::from_bits(out[b + 2]) * 1023.0) as u32,
+                c2,
+                "{l}: 10b ch2 trunc #{i}"
             );
         }
     });
 
     let sext = |v: u32, bits: u32| ((v << (32 - bits)) as i32) >> (32 - bits);
+    let cs11s = build_cs(FMT_10_11_11_SNORM, 3, 2, 4);
+    run(&cs11s, &input11, THREADS * 4, |l, out| {
+        for (i, &w) in input11.iter().enumerate() {
+            let b = i * 4;
+            assert_eq!(
+                out[b],
+                snorm_bits(sext(w & 0x7FF, 11), 11),
+                "{l}: 11b snorm ch0 #{i}"
+            );
+            assert_eq!(
+                out[b + 1],
+                snorm_bits(sext((w >> 11) & 0x7FF, 11), 11),
+                "{l}: 11b snorm ch1 #{i}"
+            );
+            assert_eq!(
+                out[b + 2],
+                snorm_bits(sext((w >> 22) & 0x3FF, 10), 10),
+                "{l}: 10b snorm ch2 #{i}"
+            );
+        }
+    });
+
     let input2: Vec<u32> = (0..THREADS)
         .map(|i| {
             let c0 = i & 3;
@@ -263,6 +326,28 @@ fn packed_unorm_and_snorm_formats_load_exact_nearest_floats() {
             c0 | (c1 << 2) | (((1023 - c1) & 0x3FF) << 12) | (((i * 29) & 0x3FF) << 22)
         })
         .collect();
+    let cs2u = build_cs(FMT_10_10_10_2_UNORM, 4, 2, 4);
+    run(&cs2u, &input2, THREADS * 4, |l, out| {
+        for (i, &w) in input2.iter().enumerate() {
+            let b = i * 4;
+            assert_eq!(out[b], unorm_bits(w & 3, 2), "{l}: 2b unorm ch0 #{i}");
+            assert_eq!(
+                out[b + 1],
+                unorm_bits((w >> 2) & 0x3FF, 10),
+                "{l}: 10b unorm ch1 #{i}"
+            );
+            assert_eq!(
+                out[b + 2],
+                unorm_bits((w >> 12) & 0x3FF, 10),
+                "{l}: 10b unorm ch2 #{i}"
+            );
+            assert_eq!(
+                out[b + 3],
+                unorm_bits((w >> 22) & 0x3FF, 10),
+                "{l}: 10b unorm ch3 #{i}"
+            );
+        }
+    });
     let cs2 = build_cs(FMT_10_10_10_2_SNORM, 4, 2, 4);
     run(&cs2, &input2, THREADS * 4, |l, out| {
         for (i, &w) in input2.iter().enumerate() {
@@ -283,6 +368,72 @@ fn packed_unorm_and_snorm_formats_load_exact_nearest_floats() {
                 snorm_bits(sext((w >> 22) & 0x3FF, 10), 10),
                 "{l}: 10b ch3 #{i}"
             );
+        }
+    });
+}
+
+/// Regression test: partial-channel loads convert only the requested channels,
+/// 2-bit SNORM does not call `norm_quotient` with `w = 1`, and over-wide loads
+/// pad missing normalized channels with `(0, 0, 0, 1.0)`.
+#[test]
+fn partial_and_padded_normalized_loads_and_2bit_snorm_codegen() {
+    // 1-channel load of 10_10_10_2_SNORM reads only the 2-bit SNORM channel:
+    // neither the 2-bit channel nor the three unread 10-bit channels should
+    // emit a norm_quotient chain.
+    NORM_QUOTIENTS.set(0);
+    let cs_2b = build_cs(FMT_10_10_10_2_SNORM, 1, 2, 2);
+    assert_eq!(
+        NORM_QUOTIENTS.get(),
+        0,
+        "2-bit SNORM and unread channels must not emit norm_quotient"
+    );
+    let input2b: Vec<u32> = (0..THREADS).map(|i| (i & 3) | (0x3FF << 2)).collect();
+    let sext = |v: u32, bits: u32| ((v << (32 - bits)) as i32) >> (32 - bits);
+    run(&cs_2b, &input2b, THREADS, |l, out| {
+        for (i, &w) in input2b.iter().enumerate() {
+            assert_eq!(
+                out[i],
+                snorm_bits(sext(w & 3, 2), 2),
+                "{l}: partial 2b snorm #{i}"
+            );
+        }
+    });
+
+    // 1-channel load of 10_11_11_UNORM converts only channel 0.
+    NORM_QUOTIENTS.set(0);
+    let cs_11x = build_cs(FMT_10_11_11_UNORM, 1, 2, 2);
+    assert_eq!(
+        NORM_QUOTIENTS.get(),
+        1,
+        "1-channel 10_11_11_UNORM must emit exactly one norm_quotient"
+    );
+    let input11x: Vec<u32> = (0..THREADS)
+        .map(|i| {
+            [0, 1, 2, 3, 5, 7, 1023, 2046, 2047]
+                .get(i as usize)
+                .copied()
+                .unwrap_or((i * 7) & 0x7FF)
+        })
+        .collect();
+    run(&cs_11x, &input11x, THREADS, |l, out| {
+        for (i, &w) in input11x.iter().enumerate() {
+            assert_eq!(out[i], unorm_bits(w & 0x7FF, 11), "{l}: partial 11b #{i}");
+        }
+    });
+
+    // 4-channel load of 8_UNORM pads channels 1..3 with (0.0, 0.0, 1.0).
+    NORM_QUOTIENTS.set(0);
+    let cs_8xyzw = build_cs(FMT_8_UNORM, 4, 0, 4);
+    assert_eq!(NORM_QUOTIENTS.get(), 1);
+    let input8 = all_bytes_packed();
+    let one = 1.0f32.to_bits();
+    run(&cs_8xyzw, &input8, THREADS * 4, |l, out| {
+        for c in 0..256u32 {
+            let b = c as usize * 4;
+            assert_eq!(out[b], unorm_bits(c, 8), "{l}: padded 8_UNORM ch0 {c}");
+            assert_eq!(out[b + 1], 0, "{l}: padded 8_UNORM ch1 {c}");
+            assert_eq!(out[b + 2], 0, "{l}: padded 8_UNORM ch2 {c}");
+            assert_eq!(out[b + 3], one, "{l}: padded 8_UNORM ch3 {c}");
         }
     });
 }
