@@ -4121,9 +4121,25 @@ impl Batch<'_> {
     }
 
     fn refresh_inner(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        if shadow.nothing_new(from, to - from) {
+            #[cfg(feature = "diagnostics")]
+            {
+                let bytes = shadow.clamped_len(from, to - from) as u64;
+                if bytes != 0 {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, bytes);
+                    add(C::Unchanged, bytes);
+                    add(C::Updates, 1);
+                    add(C::Updated, bytes);
+                    add(C::SkippedBytes, bytes);
+                    add(C::Skipped, 1);
+                }
+            }
+            return 0;
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let copied = shadow.update(from, to - from);
+        let copied = shadow.update_dirty(from, to - from);
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
         copied
@@ -4752,6 +4768,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             p.meter.frame(p.hwnd);
+            crate::watch::look_at_holes();
             #[cfg(feature = "diagnostics")]
             return Some(if ahead {
                 p.probe = probe;

@@ -113,6 +113,6 @@ mod workers;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    KernelWrite, copy_asks, guarding, kernel_writing as kernel_will_write, set_alias_lookup,
-    title_memory_remapped, writing as kernel_wrote,
+    KernelWrite, MANY_VIEWS, copy_asks, guarding, kernel_writing as kernel_will_write,
+    set_alias_lookup, title_memory_allocated, title_memory_remapped, writing as kernel_wrote,
 };

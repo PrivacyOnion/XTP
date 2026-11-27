@@ -1177,16 +1177,80 @@ impl Shadow {
         }
     }
 
+    /// Length of `[address, address + len)` that lies within this shadow copy.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn clamped_len(&self, address: usize, len: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        to.saturating_sub(from)
+    }
+
+    /// Whether [`Shadow::update`] of `[address, address + len)` would copy
+    /// nothing, and knows it without taking the write-watch or guard locks
+    /// (`crate::watch::nothing_new`). `false` if it would have to ask.
+    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return true;
+        }
+        if self.watched.load(Ordering::Relaxed) != 1 || whole_ranges() {
+            return false;
+        }
+        if !crate::watch::published(from, to) {
+            return false;
+        }
+        if self.busy().iter().any(|b| b.from < to && b.to > from) {
+            return false;
+        }
+        let base = start / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, |page, write| {
+            let at = page * PAGE;
+            copied[page - base].holds(from.max(at) - at, to.min(at + PAGE) - at, write)
+        })
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched), but where GPU work in flight writes the copy.
     /// Returns the bytes copied.
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
             return 0;
         }
+        if self.nothing_new(from, to - from) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let bytes = (to - from) as u64;
+                add(C::Checked, bytes);
+                add(C::Unchanged, bytes);
+                add(C::Updates, 1);
+                add(C::Updated, bytes);
+                add(C::SkippedBytes, bytes);
+                add(C::Skipped, 1);
+            }
+            return 0;
+        }
+        self.update_checked(from, to)
+    }
+
+    /// [`Shadow::update`] when the caller has already verified
+    /// [`Shadow::nothing_new`] returned `false`.
+    pub(crate) fn update_dirty(&self, address: usize, len: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return 0;
+        }
+        self.update_checked(from, to)
+    }
+
+    fn update_checked(&self, from: usize, to: usize) -> usize {
         let mut busy: Vec<(usize, usize)> = self
             .busy()
             .iter()
