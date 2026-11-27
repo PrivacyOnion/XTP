@@ -17,6 +17,10 @@
 //! A present finishes every submission before it returns, unless one frame
 //! is let run on while the title prepares the next (`XTP_FRAMES_IN_FLIGHT`,
 //! [`frames`]).
+//!
+//! `XTP_CARD_AWAKE=1` ([`awake`]) runs a small compute loop on its own compute
+//! queue between submissions so the driver does not lower GPU clocks during
+//! short CPU gaps (off by default).
 
 mod awake;
 pub(crate) mod buffers;
