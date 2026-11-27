@@ -208,6 +208,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `XTP_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `XTP_ADAPTER=<index>\|<name>` | (every build) host GPU to run on: its index in the startup log's `host adapter` lines, or part of its name (`XTP_ADAPTER=radeon`); by default the first high-performance hardware adapter, a discrete GPU before an integrated one |
+| `XTP_GUARD_REST=<ms>` | (every build) milliseconds a guarded view-memory block opened by a title write fault stays writable before a refresh guards it again (default `3`, `0` disables resting) |
 | `XTP_PIPELINE_WAIT_MS=<graphics>,<compute>` | (every build) milliseconds per frame title threads may wait for pipelines being made before their draws and dispatches are dropped for that frame (default `2,8`) |
 | `XTP_LIBRARY_MAP=0` | (every build) read the host pipeline library file into a heap buffer instead of memory-mapping it |
 | `XTP_LIBRARY_TRIM=0` | (every build) keep the mapped host pipeline library's pages in the working set instead of trimming them with `VirtualUnlock` after loads go idle |

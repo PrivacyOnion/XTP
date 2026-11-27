@@ -973,28 +973,58 @@ fn note_views(base: usize, len: usize, slice: &Slice, shown: bool) {
         unsafe { xtp_gpu::set_copy_back_lookup(copy_back_page) };
     });
     let section = Arc::as_ptr(&slice.section) as usize;
-    let mut a = aliases();
-    let a = &mut *a;
-    for k in 0..len / PAGE {
-        let (at, key) = (base + k * PAGE, (section, slice.index + k));
-        if !shown {
-            if a.by_address.get(&at) == Some(&key) {
-                a.by_address.remove(&at);
-                a.forget(at, key);
+    let mut crossed = Vec::new();
+    {
+        let mut a = aliases();
+        let a = &mut *a;
+        for k in 0..len / PAGE {
+            let (at, key) = (base + k * PAGE, (section, slice.index + k));
+            if !shown {
+                if a.by_address.get(&at) == Some(&key) {
+                    let was = a.by_page.get(&key).map_or(0, Vec::len);
+                    a.by_address.remove(&at);
+                    a.forget(at, key);
+                    if was > xtp_gpu::MANY_VIEWS
+                        && let Some(list) = a.by_page.get(&key)
+                        && list.len() <= xtp_gpu::MANY_VIEWS
+                    {
+                        crossed.extend_from_slice(list);
+                    }
+                }
+                continue;
             }
-            continue;
+            match a.by_address.insert(at, key) {
+                Some(old) if old == key => continue,
+                // Views do not overlap: not expected, but kept exact.
+                Some(old) => a.forget(at, old),
+                None => {}
+            }
+            let list = a.by_page.entry(key).or_default();
+            let before = list.len();
+            list.push(at);
+            if list.len() == 2 {
+                a.shared.extend(list.iter().copied());
+            } else if list.len() > 2 {
+                a.shared.insert(at);
+            }
+            if before <= xtp_gpu::MANY_VIEWS && list.len() > xtp_gpu::MANY_VIEWS {
+                crossed.extend_from_slice(&list[..before]);
+            }
         }
-        match a.by_address.insert(at, key) {
-            Some(old) if old == key => continue,
-            // Views do not overlap: not expected, but kept exact.
-            Some(old) => a.forget(at, old),
-            None => {}
+    }
+    if !crossed.is_empty() && xtp_gpu::guarding() {
+        // Crossing MANY_VIEWS stops alias lookup from linking these views; open
+        // any guarded views now so a write through the new/unlinked view is
+        // never hidden by stale PUBLISHED bits.
+        crossed.sort_unstable();
+        crossed.dedup();
+        // SAFETY: plain reads and writes of this thread's last error.
+        let error = unsafe { GetLastError() };
+        for run in crossed.chunk_by(|a, b| a + PAGE == *b) {
+            xtp_gpu::kernel_wrote(run[0], run.len() * PAGE);
         }
-        let list = a.by_page.entry(key).or_default();
-        list.push(at);
-        if list.len() > 1 {
-            a.shared.extend(list.iter().copied());
-        }
+        // SAFETY: restores this thread's last error.
+        unsafe { SetLastError(error) };
     }
 }
 
@@ -1009,13 +1039,15 @@ fn copy_back_page(at: usize, views: &mut Vec<usize>) -> Option<usize> {
 }
 
 /// For each page of `range` (title addresses) that the title shows at other
-/// addresses too, `(its address, the other's)`, once per other address: the
-/// GPU side's write guards ask it, with their lock held.
+/// addresses too (up to `MANY_VIEWS` views of one page), `(its address, the
+/// other's)`, once per other address: the GPU side's write guards ask it,
+/// with their lock held.
 fn other_views(range: Range<usize>, out: &mut Vec<(usize, usize)>) {
     let a = aliases();
     for &at in a.shared.range(range) {
         if let Some(key) = a.by_address.get(&at)
             && let Some(list) = a.by_page.get(key)
+            && list.len() <= xtp_gpu::MANY_VIEWS
         {
             out.extend(list.iter().filter(|&&x| x != at).map(|&x| (at, x)));
         }
@@ -2328,7 +2360,8 @@ mod tests {
     /// page into its heap. xmem notes the heap's view before it reports it,
     /// so the report opens the pool's guard, and the title's write through
     /// the heap is seen by the pool's copy. From then on the heap is guarded
-    /// with the pool, and a write through it faults and opens both.
+    /// with the pool, and a write through it faults and opens the heap while
+    /// leaving the pool read-only and dirty so the pool's next copy sees it.
     #[test]
     fn a_late_view_opens_the_guard_of_the_first() {
         let pages = allocate(1);
@@ -2346,12 +2379,103 @@ mod tests {
         assert!(guarded(pool) && guarded(heap), "guarded together now");
         // SAFETY: mapped; the guards' handler opens the write.
         unsafe { ((heap + 8) as *mut u8).write_volatile(2) };
-        assert!(!guarded(pool) && !guarded(heap));
+        assert!(guarded(pool) && !guarded(heap));
         assert_eq!(copy_asks(pool, 1), [pool]);
         // SAFETY: mapped, readable.
         assert_eq!(unsafe { ((pool + 8) as *const u8).read_volatile() }, 2);
         assert!(map_alias(heap as u64, 0, PAGE as u64));
         assert_eq!(XMemMapPhysicalPages(pool_at, 1, std::ptr::null()), pool_at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// A physical page mapped into more than `MANY_VIEWS` title views is
+    /// omitted from `other_views` so each view is guarded on its own.
+    #[test]
+    fn many_views_of_one_page_are_omitted_from_other_views() {
+        let count = xtp_gpu::MANY_VIEWS + 1;
+        let pages = allocate(1);
+        let base = reserve(count) as usize;
+        let base_ptr = base as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 1, pages.as_ptr()), base_ptr);
+        for k in 1..xtp_gpu::MANY_VIEWS {
+            assert!(map_alias(
+                (base + k * PAGE) as u64,
+                base as u64,
+                PAGE as u64
+            ));
+        }
+        let mut out = Vec::new();
+        other_views(base..base + PAGE, &mut out);
+        assert_eq!(out.len(), xtp_gpu::MANY_VIEWS - 1);
+        // Adding one more view crosses MANY_VIEWS: omitted from alias lookup.
+        assert!(map_alias(
+            (base + xtp_gpu::MANY_VIEWS * PAGE) as u64,
+            base as u64,
+            PAGE as u64
+        ));
+        out.clear();
+        other_views(base..base + PAGE, &mut out);
+        assert!(out.is_empty());
+        assert!(map_alias(
+            (base + PAGE) as u64,
+            0,
+            (count - 1) as u64 * PAGE as u64
+        ));
+        assert_eq!(
+            XMemMapPhysicalPages(base_ptr, 1, std::ptr::null()),
+            base_ptr
+        );
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// Crossing `MANY_VIEWS` opens any already-guarded views of that page so a
+    /// write through the new (unlinked) view is not hidden by stale bits, and
+    /// dropping back to `MANY_VIEWS` reopens single-view guards so aliases link
+    /// again on the next asking.
+    #[test]
+    fn crossing_many_views_opens_existing_guarded_views() {
+        let count = xtp_gpu::MANY_VIEWS + 1;
+        let pages = allocate(1);
+        let base = reserve(count) as usize;
+        let base_ptr = base as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 1, pages.as_ptr()), base_ptr);
+        for k in 1..xtp_gpu::MANY_VIEWS {
+            assert!(map_alias(
+                (base + k * PAGE) as u64,
+                base as u64,
+                PAGE as u64
+            ));
+        }
+        // Guard the first view (clean + PUBLISHED across the 64 views).
+        assert_eq!(copy_asks(base, 1), [base]);
+        assert!(copy_asks(base, 1).is_empty());
+        // Mapping a 65th view crosses MANY_VIEWS and opens existing guarded views.
+        let extra = base + xtp_gpu::MANY_VIEWS * PAGE;
+        assert!(map_alias(extra as u64, base as u64, PAGE as u64));
+        // SAFETY: mapped writable view of the physical page.
+        unsafe { ((extra + 16) as *mut u8).write_volatile(0x5c) };
+        assert_eq!(copy_asks(base, 1), [base]);
+        // SAFETY: mapped readable view of the physical page.
+        assert_eq!(unsafe { ((base + 16) as *const u8).read_volatile() }, 0x5c);
+        // Above MANY_VIEWS, `base` is guarded alone; dropping back to MANY_VIEWS
+        // opens `base` so the next asking links and guards its siblings again.
+        assert!(guarded(base) && !guarded(base + PAGE));
+        assert!(map_alias(extra as u64, 0, PAGE as u64));
+        assert!(
+            !guarded(base),
+            "crossing back down opened the single-view guard"
+        );
+        assert_eq!(copy_asks(base, 1), [base]);
+        assert!(guarded(base) && guarded(base + PAGE));
+        assert!(map_alias(
+            (base + PAGE) as u64,
+            0,
+            (xtp_gpu::MANY_VIEWS - 1) as u64 * PAGE as u64
+        ));
+        assert_eq!(
+            XMemMapPhysicalPages(base_ptr, 1, std::ptr::null()),
+            base_ptr
+        );
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
