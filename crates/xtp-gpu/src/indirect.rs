@@ -484,6 +484,7 @@ struct Inputs {
     count: u64,
     stats: u64,
     series: u64,
+    take_rest: bool,
 }
 
 struct Run {
@@ -645,6 +646,7 @@ fn bound_with(
         count: count_base,
         stats: stats_base,
         series: writes.series,
+        take_rest,
     };
     let capacity = if kind <= 1 {
         records
@@ -1236,6 +1238,294 @@ void main() {
                     assert_eq!(chunk_count, 2);
                     let pieces = std::slice::from_raw_parts(chunked_data.cast::<u32>().add(1), 12);
                     assert_eq!(pieces, [0, 0, 0, 65_535, 1, 1, 65_535, 0, 0, 4_465, 1, 1]);
+                }
+            }
+        }
+    }
+
+    /// Changing `take_rest` on the same list must start a new clamp run rather
+    /// than joining an open run compiled with the opposite mode.
+    #[test]
+    fn switching_rest_mode_on_one_list_starts_a_new_run() {
+        let test = "indirect::tests::switching_rest_mode_on_one_list_starts_a_new_run";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let list = host.new_list().expect("a host list");
+        // Record 0 spends 2^26 (leaves 2^26); record 1 asks for 3 * 2^24 (fits);
+        // record 2 asks for 2^26 (> 2^24 remaining -> rejected); record 3 asks for 5.
+        let words: [u32; 16] = [
+            1 << 24,
+            4,
+            0,
+            0,
+            1 << 24,
+            3,
+            0,
+            0,
+            1 << 24,
+            4,
+            0,
+            0,
+            5,
+            1,
+            0,
+            0,
+        ];
+        let (args, data) = host.shared_buffer(16 * 4).expect("args buffer");
+        // SAFETY: mapped buffer owned by this test until after `host.drain()`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), data, 16 * 4);
+        }
+        let first = bound_with(
+            &list,
+            (&args, 0),
+            (0, 16, 2),
+            None,
+            None,
+            (Writes::default(), Output::Draw),
+            false,
+        )
+        .expect("first run bounded");
+        let second = bound_with(
+            &list,
+            (&args, 32),
+            (0, 16, 2),
+            None,
+            None,
+            (Writes::default(), Output::Draw),
+            true,
+        )
+        .expect("second run bounded");
+        assert!(first.dispatched);
+        assert!(
+            second.dispatched,
+            "different take_rest must not join an open run"
+        );
+        let (_out, result) = read_commands(&list, &second, 4 + 2 * 24);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: GPU execution finished; buffer is still live and mapped.
+        unsafe {
+            let out = result.cast::<u32>();
+            assert_eq!(out.add(1).read_volatile(), 0);
+            assert_eq!(
+                out.add(1 + 6).read_volatile(),
+                0,
+                "second run uses take_rest=true, so record 3 must run empty"
+            );
+        }
+    }
+
+    /// Remaining budget after an oversized record survives across separate
+    /// clamp runs on the same list, and preserves `Output::NativePrefix`
+    /// ordering when a >65,535-group record is rejected before a small one.
+    #[test]
+    fn oversized_record_preserves_budget_across_runs_and_native_prefix() {
+        const MARKER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer marker : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint prev;
+    marker.InterlockedAdd(0, 1, prev);
+}
+"#;
+        let test =
+            "indirect::tests::oversized_record_preserves_budget_across_runs_and_native_prefix";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let worker =
+            compile_compute(&host.device, MARKER_CS).expect("marker compute shader must compile");
+        let signature = crate::draw::host_signature(2, 12).expect("native dispatch signature");
+
+        // Run 1 (args_a):
+        //   0: (65_535, 24, 1) -> spends 100_661_760 threads, leaving 33_555_968.
+        //   1: (600_000, 1, 1) -> 38_400_000 threads (> left) and > 65_535 groups -> rejected.
+        // Run 2 (args_b, separate buffer -> forces a second clamp dispatch and budget handoff):
+        //   0: (1, 1, 1)       -> fits, stays in NativePrefix because rejected record did not split.
+        //   1: (70_000, 1, 1)  -> fits, splits into 2 chunks in expanded suffix.
+        //   2: (2, 1, 1)       -> fits, follows split in expanded suffix to preserve order.
+        let run1_records: [[u32; 3]; 2] = [[65_535, 24, 1], [600_000, 1, 1]];
+        let run2_records: [[u32; 3]; 3] = [[1, 1, 1], [70_000, 1, 1], [2, 1, 1]];
+
+        for take_rest in [false, true] {
+            let list = host.new_list().expect("a host list");
+            let (args_a, data_a) = host.shared_buffer(2 * 12).expect("args_a");
+            let (args_b, data_b) = host.shared_buffer(3 * 12).expect("args_b");
+            let (stats, stats_data) = host.shared_buffer(2 * 64).expect("stats");
+            let (marker, marker_data) = host.shared_buffer(4).expect("marker");
+            // SAFETY: mapped buffers owned by this test until after `host.drain()`.
+            let (stats_gpu, marker_gpu) = unsafe {
+                std::ptr::copy_nonoverlapping(run1_records.as_ptr().cast::<u8>(), data_a, 2 * 12);
+                std::ptr::copy_nonoverlapping(run2_records.as_ptr().cast::<u8>(), data_b, 3 * 12);
+                std::ptr::write_bytes(stats_data, 0, 2 * 64);
+                marker_data.cast::<u32>().write_volatile(0);
+                (stats.GetGPUVirtualAddress(), marker.GetGPUVirtualAddress())
+            };
+
+            let first = bound_with(
+                &list,
+                (&args_a, 0),
+                (2, 12, 2),
+                None,
+                Some((stats_gpu, 0)),
+                (Writes::default(), Output::NativePrefix),
+                take_rest,
+            )
+            .expect("run 1 bounded");
+            let second = bound_with(
+                &list,
+                (&args_b, 0),
+                (2, 12, 3),
+                None,
+                Some((stats_gpu, 64)),
+                (Writes::default(), Output::NativePrefix),
+                take_rest,
+            )
+            .expect("run 2 bounded");
+            assert!(first.dispatched && second.dispatched);
+
+            let native_off = second.native_offset.expect("native prefix offset");
+            let skip = (native_off - second.offset) as usize / 4;
+            let (_read, prefix_data) = read_commands(&list, &second, (skip as u64 + 4) * 4);
+            list.keep(&signature);
+            // SAFETY: open list, live pipeline/buffers; `second.buffer` is in `INDIRECT_ARGUMENT`.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, marker_gpu);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    3,
+                    &second.buffer,
+                    native_off + 4,
+                    &second.buffer,
+                    native_off,
+                );
+            }
+
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+
+            // SAFETY: GPU execution finished; buffers are still live and mapped.
+            unsafe {
+                let hits = marker_data.cast::<u32>().read_volatile();
+                let s = stats_data.cast::<u32>();
+                let run1_past_budget = s.add(6).read_volatile();
+                let run1_split = s.add(15).read_volatile();
+                let run2_past_budget = s.add(16 + 6).read_volatile();
+                let run2_split = s.add(16 + 15).read_volatile();
+                let words = std::slice::from_raw_parts(prefix_data.cast::<u32>(), skip + 4);
+                assert_eq!(run1_past_budget, 1);
+                assert_eq!(
+                    run1_split, 0,
+                    "rejected >65,535 record must not count as split"
+                );
+                if take_rest {
+                    assert_eq!(hits, 0);
+                    assert_eq!(run2_past_budget, 3);
+                    assert_eq!(run2_split, 0);
+                    assert_eq!(words[skip], 0);
+                    assert_eq!(words[0], 0);
+                } else {
+                    assert_eq!(hits, 1, "native prefix record in run 2 must execute");
+                    assert_eq!(run2_past_budget, 0);
+                    assert_eq!(run2_split, 1);
+                    assert_eq!(&words[skip..], [1, 1, 1, 1]);
+                    assert_eq!(
+                        &words[..19],
+                        [
+                            3, 0, 0, 0, 65_535, 1, 1, 65_535, 0, 0, 4_465, 1, 1, 0, 0, 0, 2, 1, 1
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exact boundary (`cost == left` fits, `cost == left + 1` is rejected
+    /// without poisoning), zero-cost records after `left == 0` are not counted
+    /// as budget rejections, and remaining budget carries across 64-record tiles.
+    #[test]
+    fn exact_budget_boundary_and_multi_tile_records() {
+        let test = "indirect::tests::exact_budget_boundary_and_multi_tile_records";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        // 70 draw records (spans 2 tiles of 64):
+        //   0: (1 << 24, 4)     = 67_108_864 (leaves 67_108_864)
+        //   1: (1 << 24, 3)     = 50_331_648 (leaves 16_777_216)
+        //   2: (1, 1)           = 1          (leaves 16_777_215)
+        //   3: (16_777_216, 1)  = left + 1   -> rejected
+        //   4..=64: (0, 0) empty draws
+        //   65 (tile 1): (16_777_215, 1) = left -> exact fit, leaves 0
+        //   66 (tile 1): (1, 1) -> 1 > 0 -> rejected (past_budget)
+        //   67 (tile 1): (0, 0) -> 0 > 0 is false -> NOT counted in past_budget
+        //   68 (tile 1): (2, 1) -> 2 > 0 -> rejected (past_budget)
+        //   69 (tile 1): (0, 0) -> empty
+        let mut records = [[0u32; 4]; 70];
+        records[0] = [1 << 24, 4, 0, 0];
+        records[1] = [1 << 24, 3, 0, 0];
+        records[2] = [1, 1, 0, 0];
+        records[3] = [1 << 24, 1, 0, 0];
+        records[65] = [(1 << 24) - 1, 1, 0, 0];
+        records[66] = [1, 1, 0, 0];
+        records[68] = [2, 1, 0, 0];
+
+        for take_rest in [false, true] {
+            let list = host.new_list().expect("a host list");
+            let (args, data) = host.shared_buffer(70 * 16).expect("args");
+            let (stats, stats_data) = host.shared_buffer(64).expect("stats");
+            // SAFETY: mapped buffers owned by this test until after `host.drain()`.
+            let stats_gpu = unsafe {
+                std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), data, 70 * 16);
+                std::ptr::write_bytes(stats_data, 0, 64);
+                stats.GetGPUVirtualAddress()
+            };
+            let bounded = bound_with(
+                &list,
+                (&args, 0),
+                (0, 16, 70),
+                None,
+                Some((stats_gpu, 0)),
+                (Writes::default(), Output::Draw),
+                take_rest,
+            )
+            .expect("draws bounded");
+            let (_out, result) = read_commands(&list, &bounded, 4 + 70 * 24);
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+            // SAFETY: GPU execution finished; buffers are still live and mapped.
+            unsafe {
+                let out = result.cast::<u32>();
+                let vertices = |i: usize| out.add(1 + i * 6).read_volatile();
+                let s = stats_data.cast::<u32>();
+                let past_budget = s.add(6).read_volatile();
+                let spent = s.add(13).read_volatile();
+                assert_eq!(vertices(0), 1 << 24);
+                assert_eq!(vertices(1), 1 << 24);
+                assert_eq!(vertices(2), 1);
+                assert_eq!(vertices(3), 0);
+                assert_eq!(vertices(66), 0);
+                assert_eq!(vertices(68), 0);
+                assert_eq!(spent, 1 << 27);
+                if take_rest {
+                    assert_eq!(vertices(65), 0);
+                    // Rejected: records 3, 65, 66, 68 (empty records 4..=64, 67, 69 are NOT counted).
+                    assert_eq!(past_budget, 4);
+                } else {
+                    assert_eq!(vertices(65), (1 << 24) - 1);
+                    // Rejected: records 3, 66, 68 (record 65 fit exactly; empties NOT counted).
+                    assert_eq!(past_budget, 3);
                 }
             }
         }
