@@ -1459,7 +1459,7 @@ fn write_library(
                 return Ok(None);
             }
             l.names_changed.store(false, Ordering::Relaxed);
-            l.keys_changed.store(false, Ordering::AcqRel);
+            l.keys_changed.store(false, Ordering::Release);
             let names = l.names().clone();
             let keys = l.keys.read().unwrap_or_else(|e| e.into_inner()).clone();
             (
