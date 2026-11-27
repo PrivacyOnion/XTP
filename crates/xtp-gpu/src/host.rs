@@ -3064,6 +3064,9 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
+        deferred
+            .back_wanted
+            .retain(crate::texback::Target::is_valid);
         if !deferred
             .back_wanted
             .iter()
@@ -3077,11 +3080,16 @@ impl HostList {
     /// Copies wanted shader-written textures into readback buffers before the
     /// list closes ([`crate::texback::record`]).
     fn textures_back(&self) {
+        if !crate::texback::tracking() {
+            return;
+        }
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
-            self.move_to(&target.copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, target) {
+            let copy = target.copy.clone();
+            if let Some(back) = crate::texback::record(&self.list, target, || {
+                self.move_to(&copy, COPY_SOURCE);
+            }) {
                 self.deferred()
                     .texture_backs
                     .push(std::sync::Arc::new(back));
