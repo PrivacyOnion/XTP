@@ -120,9 +120,12 @@ impl Compute {
     /// Makes the pipeline from the same description as a dispatch, unless
     /// the library holds it (then it is not loaded either).
     pub fn pipeline(&self) -> Outcome {
-        let made = super::library::without_loading(|| {
-            HostPipeline::new(std::slice::from_ref(&self.0), None).is_some()
-        });
+        let shaders = std::slice::from_ref(&self.0);
+        let _ = super::library::take_last();
+        let made = super::library::without_loading(|| HostPipeline::new(shaders, None).is_some());
+        if made && super::library::take_last().cached {
+            super::library::note_cached(&super::make::key(shaders, None));
+        }
         if made {
             Outcome::Ready
         } else {
@@ -794,7 +797,11 @@ pub enum Replayed {
 /// and state. One the library holds is not loaded.
 pub fn replay(recorded: &Recorded, i: usize) -> Replayed {
     let d = &recorded.pipelines[i];
+    let _ = super::library::take_last();
     if super::library::without_loading(|| HostPipeline::new(&d.shaders, Some(&d.state)).is_some()) {
+        if super::library::take_last().cached {
+            super::library::note_cached(&super::make::key(&d.shaders, Some(&d.state)));
+        }
         return Replayed::Ready;
     }
     if d.shaders
