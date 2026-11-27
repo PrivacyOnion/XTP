@@ -1487,6 +1487,40 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Width, height and format of a single-sample 2D texture (`None` for buffers
+/// or other textures), for [`crate::texback`].
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((
+        r.desc.width,
+        r.desc.height,
+        r.desc.format,
+    ))
+}
+
+/// Single-plane console layout, title memory address and byte size of texture
+/// `this`, for [`crate::texback`]; `None` for buffers or multi-plane textures.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(xtp_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -1611,6 +1645,9 @@ fn hand_out_resource(
         if desc.dimension == BUFFER {
             crate::shadow::register(at, resource.data() as u64, desc.width);
         } else {
+            if how != PLACED_VIEW || !resource.shared {
+                crate::texback::replaced(address as usize);
+            }
             if let Some(host) = &resource.host {
                 alias::register(address, at, &desc, host);
             }
@@ -1668,6 +1705,7 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         } else {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
             alias::unregister(
                 self.data() as u64,
                 std::ptr::from_ref::<Resource>(self) as usize,
