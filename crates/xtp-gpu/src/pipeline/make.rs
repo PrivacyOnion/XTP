@@ -26,8 +26,19 @@
 //! here. Each pool makes its pipelines first use first, then those started
 //! early, and no title thread waits for a heavy one.
 //!
+//! Early pipelines remembered from an earlier run as taking at least 1 s to
+//! make (`slow-pipelines.txt`) are limited to at most a quarter of a pool's
+//! workers at once when not known to be in the library, so cheap early
+//! pipelines keep flowing. Passes over the whole screen
+//! ([`GraphicsState::screen_pass`]) get two workers of their own and a
+//! separate per-frame wait budget (`XTP_SCREEN_WAIT_MS`), so one-shot screen
+//! passes are not dropped behind thousands of others. Per-frame wait budgets
+//! are reserved up front and refunded on wake so concurrent title threads
+//! share one budget instead of multiplying it.
+//!
 //! shortcut: a pass the title runs only once and whose pipeline takes
-//! longer than the budget is lost; `XTP_PIPELINE_WAIT_MS` raises it.
+//! longer than the budget is lost; `XTP_PIPELINE_WAIT_MS` or
+//! `XTP_SCREEN_WAIT_MS` raises it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -47,6 +58,9 @@ pub(crate) struct Pending {
     /// [`CHEAP`] or [`HEAVY`]: the pool it was handed to last, which makes
     /// it. Changed under the queues' lock.
     pool: AtomicU8,
+    /// Taken by a worker from [`Queues::slow`] (counts against `slow_now`
+    /// until finished).
+    was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// Set by the call that made it, once what that call counts is in
     /// place ([`Pending::make`]).
@@ -55,6 +69,9 @@ pub(crate) struct Pending {
     /// [`key`]), and whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// A pass over the whole screen ([`GraphicsState::screen_pass`], not a
+    /// mesh pipeline), which gets dedicated workers and its own wait budget.
+    screen: bool,
     /// The graphics state as the title's stream gave it, kept for the
     /// precook once a worker has made the pipeline ([`super::record`]).
     pub(crate) stream: Option<super::record::Stream>,
@@ -109,15 +126,19 @@ impl Pending {
         graphics: Option<Box<GraphicsState>>,
         stream: Option<super::record::Stream>,
     ) -> Pending {
+        let screen = graphics.as_deref().is_some_and(GraphicsState::screen_pass)
+            && shaders.iter().all(|s| s.stage != "mesh");
         Pending {
             key: key(&shaders, graphics.as_deref()),
             shaders,
             graphics,
             queued: AtomicU8::new(IDLE),
             pool: AtomicU8::new(CHEAP as u8),
+            was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             finished: AtomicBool::new(false),
             used: AtomicBool::new(false),
+            screen,
             stream,
             #[cfg(feature = "diagnostics")]
             refusal: OnceLock::new(),
@@ -133,9 +154,17 @@ impl Pending {
             first = true;
             #[cfg(feature = "diagnostics")]
             let _ = super::host::take_refusal();
+            let _ = super::library::take_last();
             let started = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             let ms = started.elapsed().as_millis() as u64;
+            let last = super::library::take_last();
+            if !last.hit {
+                super::library::note_time(&self.key, ms);
+            }
+            if made.is_some() && last.cached {
+                super::library::note_cached(&self.key);
+            }
             if ms >= SLOW_MS {
                 tracing::info!(
                     ms,
@@ -289,35 +318,141 @@ impl Budget {
     }
 }
 
-/// The waiting done in one title frame, per kind (graphics, compute).
+/// Default per-frame wait budget for passes over the whole screen (in ms):
+/// long enough for a cold fullscreen pass on its dedicated worker without
+/// risking multi-second stalls.
+const DEFAULT_SCREEN_WAIT_MS: u64 = 500;
+
+/// Per-frame wait budget for passes over the screen (`XTP_SCREEN_WAIT_MS`,
+/// default 500 ms; `0` disables the separate screen-pass workers and wait
+/// budget).
+fn screen_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let Ok(text) = std::env::var("XTP_SCREEN_WAIT_MS") else {
+            return Duration::from_millis(DEFAULT_SCREEN_WAIT_MS);
+        };
+        match text.trim().parse::<u64>() {
+            Ok(ms) => {
+                tracing::info!(
+                    ms,
+                    "XTP_SCREEN_WAIT_MS: screen-pass pipeline wait per frame"
+                );
+                Duration::from_millis(ms)
+            }
+            Err(_) => {
+                tracing::warn!(text, "XTP_SCREEN_WAIT_MS expects a number of milliseconds");
+                Duration::from_millis(DEFAULT_SCREEN_WAIT_MS)
+            }
+        }
+    })
+}
+
+/// Whether passes over the screen get dedicated workers and their own wait
+/// budget.
+fn screens_first() -> bool {
+    !screen_budget().is_zero()
+}
+
+/// Whether the frame's wait budget is shared across all threads by reserving
+/// what is left up front and refunding what was not used. Counted only after
+/// each wait ends, N concurrent recording threads each see an empty spent
+/// counter and wait N times the budget in one frame.
+/// On by default; `XTP_PIPELINE_WAIT_SHARED=0` counts after waiting as before.
+fn shared_budget() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Whether early pipelines remembered as taking >= 1 s (`slow-pipelines.txt`)
+/// are throttled to a quarter of the pool's workers.
+/// On by default; `XTP_PIPELINE_SLOW=0` schedules all early pipelines in
+/// order without throttling.
+fn slow_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_PIPELINE_SLOW").is_none_or(|v| v != "0"))
+}
+
+/// How many workers of a pool of `workers` may make early slow pipelines at
+/// once: a quarter of them (at least 1), or unlimited when
+/// `XTP_PIPELINE_SLOW=0`.
+fn slow_limit_for(workers: usize) -> usize {
+    if !slow_enabled() {
+        usize::MAX
+    } else {
+        (workers / 4).max(1)
+    }
+}
+
+const KIND_GRAPHICS: usize = 0;
+const KIND_COMPUTE: usize = 1;
+const KIND_SCREEN: usize = 2;
+
+/// The waiting done (or reserved by threads waiting now) in one title frame,
+/// per kind (graphics, compute, screen pass).
 struct Frame {
-    frame: AtomicU64,
-    waited_us: [AtomicU64; 2],
+    spent: [Mutex<(Option<u64>, Duration)>; 3],
 }
 
 impl Frame {
     const fn new() -> Frame {
         Frame {
-            frame: AtomicU64::new(u64::MAX),
-            waited_us: [AtomicU64::new(0), AtomicU64::new(0)],
+            spent: [
+                Mutex::new((None, Duration::ZERO)),
+                Mutex::new((None, Duration::ZERO)),
+                Mutex::new((None, Duration::ZERO)),
+            ],
         }
     }
 
-    /// What is left of `budget` for `kind` in title frame `frame`.
-    fn left(&self, frame: u64, kind: usize, budget: Budget) -> Duration {
-        if self.frame.swap(frame, Ordering::Relaxed) != frame {
-            for w in &self.waited_us {
-                w.store(0, Ordering::Relaxed);
+    /// What is left of `budget` for `kind` in title frame `frame`. When
+    /// `shared` is true, reserves that whole remainder up front so other
+    /// threads in the same frame do not wait on top of it; the caller must
+    /// pass the returned duration back to [`Self::finish`]. A thread arriving
+    /// late from an older frame gets zero without resetting the current frame.
+    fn reserve(&self, frame: u64, kind: usize, budget: Duration, shared: bool) -> Duration {
+        let mut spent = self.spent[kind].lock().unwrap_or_else(|e| e.into_inner());
+        match spent.0 {
+            Some(cur) if frame < cur => return Duration::ZERO,
+            Some(cur) if cur == frame => {}
+            _ => *spent = (Some(frame), Duration::ZERO),
+        }
+        let left = budget.saturating_sub(spent.1);
+        if shared {
+            spent.1 = spent.1.saturating_add(left);
+        }
+        left
+    }
+
+    /// Accounts for `waited` out of a previously reserved `left` in `frame`
+    /// for `kind`, refunding the unused part when `shared` is true.
+    fn finish(&self, frame: u64, kind: usize, left: Duration, waited: Duration, shared: bool) {
+        let clamped = waited.min(left);
+        {
+            let mut spent = self.spent[kind].lock().unwrap_or_else(|e| e.into_inner());
+            if spent.0 == Some(frame) {
+                if shared {
+                    spent.1 = spent.1.saturating_sub(left - clamped);
+                } else {
+                    spent.1 = spent.1.saturating_add(clamped);
+                }
             }
         }
-        let waited = Duration::from_micros(self.waited_us[kind].load(Ordering::Relaxed));
-        budget.0[kind].saturating_sub(waited)
+        let stat_kind = usize::from(kind == KIND_COMPUTE);
+        WAITED_US[stat_kind].fetch_add(
+            u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
-    fn add(&self, kind: usize, waited: Duration) {
-        let us = waited.as_micros() as u64;
-        self.waited_us[kind].fetch_add(us, Ordering::Relaxed);
-        WAITED_US[kind].fetch_add(us, Ordering::Relaxed);
+    #[cfg(test)]
+    fn left(&self, frame: u64, kind: usize, budget: Duration) -> Duration {
+        let spent = self.spent[kind].lock().unwrap_or_else(|e| e.into_inner());
+        match spent.0 {
+            Some(cur) if frame < cur => Duration::ZERO,
+            Some(cur) if cur == frame => budget.saturating_sub(spent.1),
+            _ => budget,
+        }
     }
 }
 
@@ -339,13 +474,14 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or, for a cheap one, is made within
-/// the frame's budget); queues it ahead of the early ones on first use.
+/// The host pipeline if it is made (or, for a cheap or screen-pass one, is
+/// made within the frame's budget); queues it ahead of the early ones on
+/// first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     static FRAME: Frame = Frame::new();
     let frame = crate::frame::current();
     report(frame);
-    POOLS.ready(p, &FRAME, frame, Budget::get())
+    POOLS.ready(p, &FRAME, frame, Budget::get(), screen_budget())
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -359,6 +495,12 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 pub(super) fn start_builder(p: &Arc<Pending>) {
     POOLS.start(p, EARLY);
+}
+
+/// Wakes regular pool workers (e.g. after the pipeline library finishes
+/// opening so workers sleeping behind `slow_limit` can pick up library hits).
+pub(super) fn wake_workers() {
+    POOLS.wake_workers();
 }
 
 /// Un seul verdict pour toute la session. Un refus suffit, même si d'autres
@@ -399,9 +541,26 @@ fn builder_requires_every_host_pipeline() {
 }
 
 /// Waits for `p` while title frame `frame` has budget left for its kind.
-fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
-    let kind = usize::from(p.compute());
-    let left = frames.left(frame, kind, budget);
+fn wait_with(
+    p: &Pending,
+    frames: &Frame,
+    frame: u64,
+    budget: Budget,
+    screen_budget: Duration,
+    shared: bool,
+) {
+    let screen = p.screen && !screen_budget.is_zero();
+    let (kind, limit) = if screen {
+        (KIND_SCREEN, screen_budget)
+    } else if p.compute() {
+        (KIND_COMPUTE, budget.0[KIND_COMPUTE])
+    } else {
+        (KIND_GRAPHICS, budget.0[KIND_GRAPHICS])
+    };
+    if limit.is_zero() {
+        return;
+    }
+    let left = frames.reserve(frame, kind, limit, shared);
     if left.is_zero() {
         return;
     }
@@ -419,28 +578,53 @@ fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
             .0;
     }
     drop(held);
-    frames.add(kind, started.elapsed());
+    let waited = started.elapsed();
+    if screen && waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            "a pass over the screen was waited for (XTP_SCREEN_WAIT_MS=0 disables the separate budget)"
+        );
+    }
+    frames.finish(frame, kind, left, waited, shared);
 }
 
-/// One pool's pipelines: first uses first, then those started early. A
+#[cfg(test)]
+fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
+    wait_with(p, frames, frame, budget, Duration::ZERO, true);
+}
+
+/// One pool's pipelines: screen passes first, then first uses, then early
+/// ones, then early ones remembered as slow (capped by `slow_limit`). A
 /// pipeline started early and then used is in two queues (of this pool or
 /// of the other); the early entry is passed over once the pipeline is no
 /// longer [`EARLY`].
 struct Queues {
+    /// Requested passes over the screen: before all others, and the only
+    /// ones [`SCREEN_WORKERS`] take.
+    screen: VecDeque<Arc<Pending>>,
     urgent: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
+    /// Early pipelines known to take >= 1 s to make, and how many of them
+    /// are currently being made by this pool's workers.
+    slow: VecDeque<Arc<Pending>>,
+    slow_now: usize,
     /// Being made by the pool's workers.
     making: Vec<Arc<Pending>>,
     /// Whether a pipeline was passed over since a worker last finished,
-    /// for one of `making` ([`Queues::pop`]).
+    /// for one of `making` ([`Queues::pop_with`]).
     passed: bool,
 }
 
 impl Queues {
     const fn new() -> Queues {
         Queues {
+            screen: VecDeque::new(),
             urgent: VecDeque::new(),
             early: VecDeque::new(),
+            slow: VecDeque::new(),
+            slow_now: 0,
             making: Vec::new(),
             passed: false,
         }
@@ -449,14 +633,29 @@ impl Queues {
     /// Queues `p` as `how` ([`EARLY`] or [`URGENT`]) unless it is queued
     /// that way already, or taken: whether it was not queued before, or
     /// `None` if nothing changed.
+    #[cfg(test)]
     fn push(&mut self, p: &Arc<Pending>, how: u8) -> Option<bool> {
+        self.push_as(p, how, false, false)
+    }
+
+    fn push_as(
+        &mut self,
+        p: &Arc<Pending>,
+        how: u8,
+        slow: bool,
+        screens_first: bool,
+    ) -> Option<bool> {
         let was = p.queued.load(Ordering::Relaxed);
         if was >= how {
             return None;
         }
         p.queued.store(how, Ordering::Relaxed);
-        if how == URGENT {
+        if how == URGENT && p.screen && screens_first {
+            self.screen.push_back(p.clone());
+        } else if how == URGENT {
             self.urgent.push_back(p.clone());
+        } else if slow {
+            self.slow.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -464,30 +663,69 @@ impl Queues {
     }
 
     /// The next pipeline to make, taken ([`MAKING`]) and listed as being
-    /// made: the first, first uses then early ones, that would not wait
-    /// for another worker of the pool. Two pipelines of one program would:
-    /// the second worker would wait for the first one's translation, which
-    /// takes up to 38 s for a heavy program ([`waits_for`]). Those passed
-    /// over keep their place.
-    fn pop(&mut self) -> Option<Arc<Pending>> {
+    /// made: screen passes first, then (for non-screen workers) first uses,
+    /// early ones, and early slow ones up to `slow_limit` at once. Library
+    /// hits (`is_cached`) are never throttled by `slow_limit`. Pipelines
+    /// sharing an untranslated heavy shader with one in `making` are passed
+    /// over ([`waits_for`]) and keep their place.
+    fn pop_with(
+        &mut self,
+        screens_only: bool,
+        slow_limit: usize,
+        is_cached: impl Fn(&Pending) -> bool,
+    ) -> Option<Arc<Pending>> {
         let Queues {
+            screen,
             urgent,
             early,
+            slow,
+            slow_now,
             making,
             passed,
         } = self;
-        let p = take(urgent, making, None, passed)
-            .or_else(|| take(early, making, Some(EARLY), passed))?;
+        let mut p = take(screen, making, None, passed);
+        if p.is_none() && !screens_only {
+            p = take(urgent, making, None, passed)
+                .or_else(|| take(early, making, Some(EARLY), passed));
+            if p.is_none() {
+                if *slow_now < slow_limit {
+                    p = take(slow, making, Some(EARLY), passed);
+                    if let Some(p) = &p
+                        && !is_cached(p)
+                    {
+                        p.was_slow.store(true, Ordering::Relaxed);
+                        *slow_now += 1;
+                    }
+                } else {
+                    // Library hits queued before the library finished
+                    // opening are never throttled.
+                    p = take_matching(slow, making, Some(EARLY), passed, &is_cached);
+                }
+            }
+        }
+        let p = p?;
         p.queued.store(MAKING, Ordering::Relaxed);
         making.push(p.clone());
         Some(p)
     }
 
-    /// `p` is made: no longer listed as being made. Whether a pipeline was
-    /// passed over for one being made since the last call.
+    #[cfg(test)]
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        self.pop_with(false, usize::MAX, |_| false)
+    }
+
+    /// `p` is made: no longer listed as being made. Returns true if a
+    /// waiting worker should be woken (something was passed over for one
+    /// being made, or a throttled slow pipeline slot just freed up).
     fn made(&mut self, p: &Arc<Pending>) -> bool {
         self.making.retain(|m| !Arc::ptr_eq(m, p));
-        std::mem::take(&mut self.passed)
+        let freed_slow = if p.was_slow.swap(false, Ordering::Relaxed) {
+            self.slow_now = self.slow_now.saturating_sub(1);
+            true
+        } else {
+            false
+        };
+        std::mem::take(&mut self.passed) || freed_slow
     }
 }
 
@@ -501,11 +739,24 @@ fn take(
     live: Option<u8>,
     passed: &mut bool,
 ) -> Option<Arc<Pending>> {
+    take_matching(queue, making, live, passed, |_| true)
+}
+
+/// Like [`take`], taking only an entry for which `matches` returns true.
+fn take_matching(
+    queue: &mut VecDeque<Arc<Pending>>,
+    making: &[Arc<Pending>],
+    live: Option<u8>,
+    passed: &mut bool,
+    matches: impl Fn(&Pending) -> bool,
+) -> Option<Arc<Pending>> {
     let mut i = 0;
     while i < queue.len() {
         let p = &queue[i];
         if live.is_some_and(|how| p.queued.load(Ordering::Relaxed) != how) {
             queue.remove(i);
+        } else if !matches(p) {
+            i += 1;
         } else if waits_for(p, making) {
             *passed = true;
             i += 1;
@@ -578,6 +829,17 @@ struct Taken {
     unready: u64,
 }
 
+/// Workers started per pool and dedicated to passes over the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Started {
+    pools: [usize; 2],
+    screen: usize,
+}
+
+/// Dedicated workers that make passes over the screen alone, besides the
+/// regular pools ([`screen_budget`], `XTP_SCREEN_WAIT_MS`).
+const SCREEN_WORKERS: usize = 2;
+
 /// The workers, their pools' queues, and what they did.
 struct Pools {
     /// Both pools' queues ([`CHEAP`], [`HEAVY`]), under one lock: a
@@ -586,8 +848,11 @@ struct Pools {
     queues: Mutex<[Queues; 2]>,
     /// Signalled when a pool has a pipeline to make.
     ready: [Condvar; 2],
-    /// Workers per pool, started on first use.
-    workers: OnceLock<[usize; 2]>,
+    /// Signalled when [`Queues::screen`] in [`CHEAP`] has a screen pass to
+    /// make.
+    screen_ready: Condvar,
+    /// Workers per pool (and screen-pass workers), started on first use.
+    workers: OnceLock<Started>,
     counts: [Counts; 2],
 }
 
@@ -599,30 +864,53 @@ impl Pools {
         Pools {
             queues: Mutex::new([Queues::new(), Queues::new()]),
             ready: [Condvar::new(), Condvar::new()],
+            screen_ready: Condvar::new(),
             workers: OnceLock::new(),
             counts: [Counts::new(), Counts::new()],
         }
     }
 
     /// The workers per pool, started now if they are not yet.
-    fn workers(&'static self) -> [usize; 2] {
+    fn workers(&'static self) -> Started {
         *self.workers.get_or_init(|| {
             let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
-            self.spawn(wanted(processors))
+            let asked = match std::env::var("XTP_PIPELINE_WORKERS") {
+                Ok(text) => match text.trim().parse::<usize>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        tracing::warn!(text, "XTP_PIPELINE_WORKERS expects a number of workers");
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            let ram_cap = std::env::var_os("XTP_PIPELINE_RAM_CAP").is_some_and(|v| v == "1");
+            let limited_ram = ram_cap && limited_host_ram();
+            let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+            self.spawn(wanted_for(processors, asked, ram_cap, limited_ram), screens)
         })
     }
 
-    /// Starts `wanted` workers per pool: how many started.
-    fn spawn(&'static self, wanted: [usize; 2]) -> [usize; 2] {
+    /// Wakes sleeping workers in both regular pools.
+    fn wake_workers(&self) {
+        let _held = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        self.ready[CHEAP].notify_all();
+        self.ready[HEAVY].notify_all();
+    }
+
+    /// Starts `wanted` workers per pool and `wanted_screen` screen-pass
+    /// workers: how many started.
+    fn spawn(&'static self, wanted: [usize; 2], wanted_screen: usize) -> Started {
         let mut started = [0; 2];
         for pool in [CHEAP, HEAVY] {
+            let slow_limit = slow_limit_for(wanted[pool]);
             started[pool] = (0..wanted[pool])
                 .filter(|&i| {
                     let name = match pool {
                         CHEAP => format!("xtp-pipelines-{i}"),
                         _ => format!("xtp-pipelines-heavy-{i}"),
                     };
-                    let spawned = worker(name).spawn(move || self.work(pool));
+                    let spawned = worker(name).spawn(move || self.work(pool, false, slow_limit));
                     if let Err(e) = &spawned {
                         tracing::warn!(error = %e, pool = POOL_NAMES[pool], "no pipeline worker");
                     }
@@ -630,30 +918,48 @@ impl Pools {
                 })
                 .count();
         }
+        let screen = (0..wanted_screen)
+            .filter(|&i| {
+                let name = format!("xtp-pipelines-screen-{i}");
+                let spawned = worker(name).spawn(move || self.work(CHEAP, true, 0));
+                if let Err(e) = &spawned {
+                    tracing::warn!(error = %e, pool = "screen", "no pipeline worker");
+                }
+                spawned.is_ok()
+            })
+            .count();
         tracing::info!(
             cheap = started[CHEAP],
             heavy = started[HEAVY],
+            screen,
             heavy_from_bytes = HEAVY_BYTES,
             "pipeline workers"
         );
-        started
+        Started {
+            pools: started,
+            screen,
+        }
     }
 
-    /// The host pipeline if it is made, or (for a cheap one) is made within
-    /// the frame's budget; queues it ahead of the early ones on first use.
-    /// A heavy one is not waited for: it takes seconds, and the frame's
-    /// budget is the cheap ones'.
+    /// The host pipeline if it is made, or (for a cheap, library-cached, or
+    /// screen-pass one) is made within the frame's budget; queues it ahead
+    /// of the early ones on first use. An uncached heavy non-screen pipeline
+    /// is not waited for: it takes seconds, and the frame's budget is the
+    /// cheap ones'.
     fn ready<'a>(
         &'static self,
         p: &'a Arc<Pending>,
         frames: &Frame,
         frame: u64,
         budget: Budget,
+        screen_budget: Duration,
     ) -> Option<&'a HostPipeline> {
         if p.made.get().is_none() {
-            self.start(p, URGENT);
-            if !heavy(p) {
-                wait(p, frames, frame, budget);
+            let screens = !screen_budget.is_zero();
+            self.start_as(p, URGENT, screens);
+            let screen = p.screen && screens;
+            if screen || !heavy(p) || super::library::in_library(&p.key) {
+                wait_with(p, frames, frame, budget, screen_budget, shared_budget());
             }
             if p.made.get().is_none() {
                 self.counts[p.pool()]
@@ -662,7 +968,10 @@ impl Pools {
             }
         }
         let made = p.made.get()?.as_ref();
-        if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
+        if made.is_some()
+            && !p.used.load(Ordering::Relaxed)
+            && !p.used.swap(true, Ordering::Relaxed)
+        {
             super::library::note_used(&p.key);
         }
         made
@@ -672,12 +981,17 @@ impl Pools {
     /// ahead of the early ones on a first use, unless a worker has taken
     /// it already.
     fn start(&'static self, p: &Arc<Pending>, how: u8) {
+        self.start_as(p, how, screens_first());
+    }
+
+    fn start_as(&'static self, p: &Arc<Pending>, how: u8, screens_first: bool) {
         if p.queued.load(Ordering::Relaxed) >= how {
             return;
         }
-        let workers = self.workers();
-        if workers == [0, 0] {
-            // No worker: made here instead.
+        let started = self.workers();
+        let screen_lane = how == URGENT && p.screen && screens_first;
+        if started.pools == [0, 0] && !(screen_lane && started.screen > 0) {
+            // No worker can take `p`: make it here instead.
             let was = {
                 let _held = self.queues.lock().unwrap_or_else(|e| e.into_inner());
                 p.queued.swap(MAKING, Ordering::Relaxed)
@@ -691,10 +1005,18 @@ impl Pools {
             }
             return;
         }
-        let pool = pool_for(p, workers);
+        let pool = if screen_lane && (started.pools[CHEAP] > 0 || started.screen > 0) {
+            CHEAP
+        } else {
+            pool_for(p, started.pools)
+        };
+        let slow = how == EARLY
+            && slow_enabled()
+            && !super::library::in_library(&p.key)
+            && super::library::slow(&p.key);
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         let was = p.pool();
-        match queues[pool].push(p, how) {
+        match queues[pool].push_as(p, how, slow, screens_first) {
             Some(true) => {
                 PEAK.fetch_max(
                     WAITING.fetch_add(1, Ordering::Relaxed) + 1,
@@ -710,6 +1032,9 @@ impl Pools {
             None => return,
         }
         p.pool.store(pool as u8, Ordering::Relaxed);
+        if screen_lane && pool == CHEAP {
+            self.screen_ready.notify_one();
+        }
         self.ready[pool].notify_one();
     }
 
@@ -718,7 +1043,7 @@ impl Pools {
     /// workers (VIctory #1505: 236 pipelines a minute at the start screen,
     /// 7 a minute in the world), and XTP's Series S world dropped 571 to
     /// 747 draws a frame waiting for a pipeline "being made".
-    fn work(&self, pool: usize) {
+    fn work(&self, pool: usize, screens_only: bool, slow_limit: usize) {
         let mut done: Option<Arc<Pending>> = None;
         loop {
             let next = {
@@ -726,16 +1051,25 @@ impl Pools {
                 if let Some(done) = done.take()
                     && queues[pool].made(&done)
                 {
-                    // What it passed over may be free now.
+                    // What it passed over (or a throttled slow pipeline) may
+                    // be free to run now.
                     self.ready[pool].notify_all();
+                    if pool == CHEAP && !queues[CHEAP].screen.is_empty() {
+                        self.screen_ready.notify_all();
+                    }
                 }
                 loop {
-                    if let Some(p) = queues[pool].pop() {
+                    if let Some(p) = queues[pool].pop_with(screens_only, slow_limit, |p| {
+                        super::library::in_library(&p.key)
+                    }) {
                         break p;
                     }
-                    queues = self.ready[pool]
-                        .wait(queues)
-                        .unwrap_or_else(|e| e.into_inner());
+                    let cond = if screens_only {
+                        &self.screen_ready
+                    } else {
+                        &self.ready[pool]
+                    };
+                    queues = cond.wait(queues).unwrap_or_else(|e| e.into_inner());
                 }
             };
             self.finish(&next);
@@ -766,10 +1100,15 @@ impl Pools {
     }
 }
 
-/// The pool that makes `p`: the heavy one for a heavy pipeline
+/// The pool that makes `p`: the heavy one for an uncached heavy pipeline
 /// ([`heavy`]), else the cheap one; the other one if that has no worker.
+/// Library hits are never sent to the heavy pool.
 fn pool_for(p: &Pending, workers: [usize; 2]) -> usize {
-    let pool = if heavy(p) { HEAVY } else { CHEAP };
+    let pool = if heavy(p) && !super::library::in_library(&p.key) {
+        HEAVY
+    } else {
+        CHEAP
+    };
     if workers[pool] > 0 { pool } else { 1 - pool }
 }
 
@@ -807,10 +1146,46 @@ const HEAVY_WORKERS: usize = 2;
 /// Workers per pool ([`CHEAP`], [`HEAVY`]) for `processors` logical
 /// processors: half of them, 2 to [`MAX_WORKERS`], of which
 /// [`HEAVY_WORKERS`] (one, of fewer than 8) are the heavy pool's.
+#[cfg(test)]
 fn wanted(processors: usize) -> [usize; 2] {
-    let all = (processors / 2).clamp(2, MAX_WORKERS);
-    let heavy = if all >= 8 { HEAVY_WORKERS } else { 1 };
+    wanted_for(processors, None, false, false)
+}
+
+/// Workers per pool ([`CHEAP`], [`HEAVY`]) for `processors` logical
+/// processors: `asked` (`XTP_PIPELINE_WORKERS`, 1 to 64) overrides the
+/// default; `ram_cap` (`XTP_PIPELINE_RAM_CAP=1`, off by default) caps the
+/// default at 8 on hosts with at most 32 GiB of physical RAM (`limited_ram`).
+fn wanted_for(
+    processors: usize,
+    asked: Option<usize>,
+    ram_cap: bool,
+    limited_ram: bool,
+) -> [usize; 2] {
+    let all = match asked {
+        Some(n) => n.clamp(1, 64),
+        None if ram_cap && limited_ram => (processors / 2).clamp(2, 8),
+        None => (processors / 2).clamp(2, MAX_WORKERS),
+    };
+    let heavy = if all >= 8 {
+        HEAVY_WORKERS
+    } else if all >= 2 {
+        1
+    } else {
+        0
+    };
     [all - heavy, heavy]
+}
+
+/// Whether the host has at most 32 GiB of physical RAM (used only when
+/// `XTP_PIPELINE_RAM_CAP=1`).
+fn limited_host_ram() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure of ours.
+    unsafe { GlobalMemoryStatusEx(&mut status) != 0 && status.ullTotalPhys <= 32u64 << 30 }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -926,8 +1301,8 @@ mod tests {
     /// Pools of their own with `workers` per pool, for a test.
     fn pools(workers: [usize; 2]) -> &'static Pools {
         let pools: &'static Pools = Box::leak(Box::new(Pools::new()));
-        let started = pools.spawn(workers);
-        assert_eq!(started, workers, "workers started");
+        let started = pools.spawn(workers, 0);
+        assert_eq!(started.pools, workers, "workers started");
         pools.workers.set(started).unwrap();
         pools
     }
@@ -964,7 +1339,7 @@ mod tests {
             "a new frame waits again"
         );
         // Compute pipelines have their own.
-        assert_eq!(frames.left(8, 1, budget), Duration::from_millis(60));
+        assert_eq!(frames.left(8, 1, budget.0[1]), Duration::from_millis(60));
         assert!(take_wait_us()[0] >= 60_000);
     }
 
@@ -1266,11 +1641,15 @@ mod tests {
         assert!(super::heavy(&heavy) && !super::heavy(&cheap));
         let budget = Budget([Duration::from_secs(30); 2]);
         assert!(
-            split.ready(&heavy, &frames, 1, budget).is_none(),
+            split
+                .ready(&heavy, &frames, 1, budget, Duration::ZERO)
+                .is_none(),
             "a heavy pipeline is not waited for"
         );
         assert!(
-            split.ready(&cheap, &frames, 1, budget).is_some(),
+            split
+                .ready(&cheap, &frames, 1, budget, Duration::ZERO)
+                .is_some(),
             "the cheap one is made within the budget"
         );
         assert!(
@@ -1305,9 +1684,13 @@ mod tests {
         let ((heavy, release), (cheap, _)) =
             (pipeline(HEAVY_WORDS, 3, true), pipeline(0, 4, false));
         let short = Budget([Duration::from_millis(300); 2]);
-        assert!(one.ready(&heavy, &frames, 2, short).is_none());
         assert!(
-            one.ready(&cheap, &frames, 2, short).is_none(),
+            one.ready(&heavy, &frames, 2, short, Duration::ZERO)
+                .is_none()
+        );
+        assert!(
+            one.ready(&cheap, &frames, 2, short, Duration::ZERO)
+                .is_none(),
             "with one queue, the cheap one is not made while the heavy one is"
         );
         assert!(!cheap.finished.load(Ordering::Relaxed));
@@ -1318,5 +1701,358 @@ mod tests {
             "with one queue, the cheap one is made after the heavy one"
         );
         assert!(matches!(cheap.made.get(), Some(Some(_))));
+    }
+
+    /// Early pipelines known to take long leave workers for the others: at
+    /// most `slow_limit` run at once, a draw asking for one runs at once
+    /// without counting against the cap, and a library hit is never
+    /// throttled.
+    #[test]
+    fn pipelines_known_to_take_long_leave_workers_for_the_others() {
+        let new = || Arc::new(Pending::new(Vec::new(), None, None));
+        let (long, longer, asked, quick, cached) = (new(), new(), new(), new(), new());
+        let mut queues = Queues::new();
+        for p in [&long, &longer, &asked, &cached] {
+            assert_eq!(queues.push_as(p, EARLY, true, true), Some(true));
+        }
+        assert_eq!(queues.push_as(&quick, EARLY, false, true), Some(true));
+        // The quick one first, then one long one at a time; a draw asking
+        // for one waits for nobody.
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &quick
+        ));
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &long
+        ));
+        assert!(queues.pop_with(false, 1, |_| false).is_none());
+        // A library hit is never throttled, even when the slow limit is full.
+        assert!(Arc::ptr_eq(
+            &queues
+                .pop_with(false, 1, |p| std::ptr::eq(p, Arc::as_ptr(&cached)))
+                .unwrap(),
+            &cached
+        ));
+        assert!(!cached.was_slow.load(Ordering::Relaxed));
+        assert_eq!(queues.slow_now, 1);
+
+        assert_eq!(queues.push_as(&asked, URGENT, true, true), Some(false));
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &asked
+        ));
+        assert!(!asked.was_slow.load(Ordering::Relaxed));
+        assert!(queues.pop_with(false, 1, |_| false).is_none());
+        assert!(queues.made(&long), "freed a slow slot");
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &longer
+        ));
+        assert!(queues.pop_with(false, 1, |_| false).is_none());
+    }
+
+    /// Passes over the screen go before all others, and screen-pass workers
+    /// take nothing else.
+    #[test]
+    fn passes_over_the_screen_go_first() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+        };
+
+        let mut screen_state = GraphicsState::default();
+        screen_state.targets.NumRenderTargets = 1;
+        screen_state.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        screen_state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        assert!(screen_state.screen_pass());
+
+        let mut no_targets = screen_state.clone();
+        no_targets.targets.NumRenderTargets = 0;
+        assert!(!no_targets.screen_pass());
+
+        let mut line_state = screen_state.clone();
+        line_state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!line_state.screen_pass());
+
+        // Depth format set with default DepthEnable=true is not a screen pass;
+        // disabling both depth and stencil makes it one again.
+        let mut with_depth = screen_state.clone();
+        // SAFETY: subobject type 16 is a 4-byte DXGI_FORMAT at +4.
+        unsafe {
+            let mut sub = [0u8; 8];
+            sub[0..4].copy_from_slice(&16u32.to_le_bytes());
+            sub[4..8].copy_from_slice(&(DXGI_FORMAT_D32_FLOAT.0 as u32).to_le_bytes());
+            with_depth.read(16, sub.as_ptr());
+        }
+        assert!(!with_depth.screen_pass());
+        // SAFETY: subobject type 11 is a D3D12_DEPTH_STENCIL_DESC at +4.
+        unsafe {
+            let ds = windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_DESC::default();
+            let mut sub = vec![0u8; 4 + size_of_val(&ds)];
+            sub[0..4].copy_from_slice(&11u32.to_le_bytes());
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&ds).cast::<u8>(),
+                sub.as_mut_ptr().add(4),
+                size_of_val(&ds),
+            );
+            with_depth.read(11, sub.as_ptr());
+        }
+        assert!(with_depth.screen_pass());
+
+        let screen = Arc::new(Pending::new(
+            vec![program("vertex", 64), program("pixel", 64)],
+            Some(Box::new(screen_state.clone())),
+            None,
+        ));
+        assert!(screen.screen);
+        let mesh = Arc::new(Pending::new(
+            vec![program("mesh", 64), program("pixel", 64)],
+            Some(Box::new(screen_state.clone())),
+            None,
+        ));
+        assert!(!mesh.screen, "mesh pipelines are not screen passes");
+        let world = Arc::new(Pending::new(Vec::new(), None, None));
+        assert!(!world.screen);
+
+        let mut queues = Queues::new();
+        assert_eq!(queues.push_as(&world, URGENT, false, true), Some(true));
+        assert_eq!(queues.push_as(&screen, URGENT, false, true), Some(true));
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(true, 1, |_| false).unwrap(),
+            &screen
+        ));
+        assert!(queues.pop_with(true, 1, |_| false).is_none());
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &world
+        ));
+
+        // With `screens_first = false` (`XTP_SCREEN_WAIT_MS=0`), a screen pass
+        // goes into the regular `urgent` queue rather than `screen`.
+        let screen_off = Arc::new(Pending::new(
+            vec![program("vertex", 64), program("pixel", 64)],
+            Some(Box::new(screen_state)),
+            None,
+        ));
+        assert_eq!(
+            queues.push_as(&screen_off, URGENT, false, false),
+            Some(true)
+        );
+        assert!(queues.pop_with(true, 1, |_| false).is_none());
+        assert!(Arc::ptr_eq(
+            &queues.pop_with(false, 1, |_| false).unwrap(),
+            &screen_off
+        ));
+    }
+
+    /// Dedicated screen workers make a screen pass while the regular worker is
+    /// blocked on a heavy pipeline, and a pool with only screen workers still
+    /// makes non-screen pipelines inline instead of hanging.
+    #[test]
+    fn screen_workers_make_screen_passes_and_non_screen_falls_back_inline() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        let mut screen_state = GraphicsState::default();
+        screen_state.targets.NumRenderTargets = 1;
+        screen_state.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        screen_state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+        // Pool with 0 regular workers and 1 screen worker: non-screen work
+        // (and screen passes when `screens_first = false`) must fall back
+        // inline instead of queueing onto an empty pool forever.
+        let screen_only: &'static Pools = Box::leak(Box::new(Pools::new()));
+        let started = screen_only.spawn([0, 0], 1);
+        assert_eq!(
+            started,
+            Started {
+                pools: [0, 0],
+                screen: 1
+            }
+        );
+        screen_only.workers.set(started).unwrap();
+
+        let regular = Arc::new(Pending::new(Vec::new(), None, None));
+        screen_only.start_as(&regular, URGENT, true);
+        assert!(regular.finished.load(Ordering::Acquire), "made inline");
+
+        let screen_disabled = Arc::new(Pending::new(
+            Vec::new(),
+            Some(Box::new(screen_state.clone())),
+            None,
+        ));
+        screen_only.start_as(&screen_disabled, URGENT, false);
+        assert!(
+            screen_disabled.finished.load(Ordering::Acquire),
+            "made inline when screen lane disabled"
+        );
+
+        let screen = Arc::new(Pending::new(
+            Vec::new(),
+            Some(Box::new(screen_state.clone())),
+            None,
+        ));
+        screen_only.start_as(&screen, URGENT, true);
+        until_finished(&screen);
+        assert!(
+            screen.finished.load(Ordering::Acquire),
+            "made by screen worker"
+        );
+
+        // End-to-end with WARP: block the sole regular worker on a held heavy
+        // compute shader; a screen pass still completes immediately on its
+        // dedicated screen worker.
+        let test = "pipeline::make::tests::screen_workers_make_screen_passes_and_non_screen_falls_back_inline";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let with_screen: &'static Pools = Box::leak(Box::new(Pools::new()));
+        let started = with_screen.spawn([1, 0], 1);
+        assert_eq!(
+            started,
+            Started {
+                pools: [1, 0],
+                screen: 1
+            }
+        );
+        with_screen.workers.set(started).unwrap();
+
+        let (heavy_shader, release) = compute(HEAVY_WORDS, 11, true);
+        let heavy_p = Arc::new(Pending::new(vec![heavy_shader], None, None));
+        let frames = Frame::new();
+        let budget = Budget([Duration::from_millis(2), Duration::from_millis(8)]);
+        assert!(
+            with_screen
+                .ready(&heavy_p, &frames, 1, budget, Duration::from_millis(500))
+                .is_none()
+        );
+        // Wait until the regular worker has claimed `heavy_p`.
+        let claimed = Instant::now();
+        while heavy_p.queued.load(Ordering::Relaxed) != MAKING
+            && claimed.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(heavy_p.queued.load(Ordering::Relaxed), MAKING);
+
+        let screen_p = Arc::new(Pending::new(Vec::new(), Some(Box::new(screen_state)), None));
+        let _ = with_screen.ready(&screen_p, &frames, 1, budget, Duration::from_secs(5));
+        until_finished(&screen_p);
+        assert!(
+            !heavy_p.finished.load(Ordering::Acquire),
+            "screen pass completed while regular worker was still busy"
+        );
+        drop(release);
+        until_finished(&heavy_p);
+        assert!(matches!(heavy_p.made.get(), Some(Some(_))));
+    }
+
+    /// Four threads sharing a 40 ms budget in one frame return within about
+    /// 40 ms in total (not 160 ms), and unused reserved budget is refunded
+    /// when a pipeline finishes early.
+    #[test]
+    fn four_threads_sharing_a_frame_budget_wait_at_most_the_budget() {
+        let never = Pending::new(Vec::new(), None, None);
+        let frames = Frame::new();
+        let budget = Budget([Duration::from_millis(40), Duration::from_millis(40)]);
+        let ready_gate = std::sync::Barrier::new(4);
+        let wall_start = Instant::now();
+        let per_thread: Vec<Duration> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        ready_gate.wait();
+                        let started = Instant::now();
+                        wait_with(&never, &frames, 1, budget, Duration::ZERO, true);
+                        started.elapsed()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let wall = wall_start.elapsed();
+        let total: Duration = per_thread.iter().copied().sum();
+        assert!(wall >= Duration::from_millis(30), "waited once: {wall:?}");
+        assert!(
+            total < Duration::from_millis(120),
+            "shared 40 ms budget across 4 threads took {total:?} total ({per_thread:?})"
+        );
+        // Three threads saw 0 ms left and returned promptly.
+        let fast = per_thread
+            .iter()
+            .filter(|&&d| d < Duration::from_millis(20))
+            .count();
+        assert_eq!(
+            fast, 3,
+            "three threads returned immediately: {per_thread:?}"
+        );
+
+        // Refund: a thread whose pipeline finishes early gives the unused
+        // budget back to the same frame.
+        let quick = Arc::new(Pending::new(Vec::new(), None, None));
+        let quick_budget = Budget([Duration::from_millis(200), Duration::from_millis(200)]);
+        let q = quick.clone();
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                wait_with(&quick, &frames, 2, quick_budget, Duration::ZERO, true);
+            });
+            std::thread::sleep(Duration::from_millis(15));
+            q.make(|| {});
+            waiter.join().unwrap();
+        });
+        let remaining = frames.left(2, KIND_GRAPHICS, Duration::from_millis(200));
+        assert!(
+            remaining > Duration::from_millis(50),
+            "unused budget was refunded: {remaining:?}"
+        );
+    }
+
+    /// A late thread from an older frame gets zero budget without resetting
+    /// the current frame; unshared mode (`XTP_PIPELINE_WAIT_SHARED=0`) lets
+    /// concurrent threads wait independently; huge budgets and `u64::MAX`
+    /// frame numbers do not overflow or collide with a sentinel.
+    #[test]
+    fn frame_budget_edge_cases_do_not_reset_or_overflow() {
+        let frames = Frame::new();
+        let budget = Duration::from_millis(40);
+        assert_eq!(frames.reserve(5, KIND_GRAPHICS, budget, true), budget);
+        // A late thread from frame 4 must not reset frame 5's reservation.
+        assert_eq!(
+            frames.reserve(4, KIND_GRAPHICS, budget, true),
+            Duration::ZERO
+        );
+        assert_eq!(frames.left(5, KIND_GRAPHICS, budget), Duration::ZERO);
+        frames.finish(5, KIND_GRAPHICS, budget, Duration::from_millis(10), true);
+        assert_eq!(
+            frames.left(5, KIND_GRAPHICS, budget),
+            Duration::from_millis(30)
+        );
+
+        // Unshared mode: two threads both reserve the full budget, and huge
+        // budgets saturate instead of panicking on overflow.
+        let unshared = Frame::new();
+        let huge = Duration::from_millis(u64::MAX);
+        assert_eq!(unshared.reserve(u64::MAX, KIND_SCREEN, huge, false), huge);
+        assert_eq!(unshared.reserve(u64::MAX, KIND_SCREEN, huge, false), huge);
+        unshared.finish(u64::MAX, KIND_SCREEN, huge, huge, false);
+        unshared.finish(u64::MAX, KIND_SCREEN, huge, huge, false);
+        assert_eq!(unshared.left(u64::MAX, KIND_SCREEN, huge), Duration::ZERO);
+    }
+
+    /// The default worker count is not lowered on <= 32 GiB RAM; the RAM
+    /// cap applies only when requested (`XTP_PIPELINE_RAM_CAP=1`), and an
+    /// explicit worker count (`XTP_PIPELINE_WORKERS`) overrides both.
+    #[test]
+    fn worker_count_keeps_default_and_honors_switches() {
+        assert_eq!(wanted_for(32, None, false, true), [14, 2]);
+        assert_eq!(wanted_for(32, None, true, false), [14, 2]);
+        assert_eq!(wanted_for(32, None, true, true), [6, 2]);
+        assert_eq!(wanted_for(12, None, true, true), [5, 1]);
+        assert_eq!(wanted_for(32, Some(0), true, true), [1, 0]);
+        assert_eq!(wanted_for(32, Some(12), true, true), [10, 2]);
+        assert_eq!(wanted_for(32, Some(100), false, false), [62, 2]);
     }
 }

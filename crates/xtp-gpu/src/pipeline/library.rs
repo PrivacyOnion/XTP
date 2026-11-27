@@ -81,12 +81,19 @@
 //!   has loaded yet cannot be known to fail without a load: the session
 //!   that first finds such an entry makes the pipeline beside it and says
 //!   so in the names file, and the precooks after it count it no more.
+//! - Beside `early-pipelines.txt`, `slow-pipelines.txt` remembers title
+//!   pipelines whose creation (not a library hit) took at least [`SLOW_MS`],
+//!   so the scheduler can throttle early builds of slow pipelines without
+//!   throttling library hits. Beside each generation's library file,
+//!   `host-pipelines-<id>.keys` lists the early keys stored in that file
+//!   (validated against its [`FileId`]) so library hits are recognised
+//!   before translation.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -129,6 +136,12 @@ struct Library {
     names: RwLock<Names>,
     /// Names learned since the names file was last written.
     names_changed: AtomicBool,
+    /// Early keys ([`super::make::key`]) of title pipelines known to be
+    /// held by this library file, so library hits are never throttled.
+    /// Shared with [`OPEN_KEYS`] so [`in_library`] never blocks on a save.
+    keys: Arc<RwLock<HashSet<String>>>,
+    /// Early keys learned since the keys file was last written.
+    keys_changed: AtomicBool,
     /// The library file this library holds the same pipelines as: the one
     /// it was read from (`_blob`, accepted: hashed when first needed) or
     /// the one last saved. `None` with `_blob` not the file's (empty, or
@@ -147,11 +160,12 @@ struct Generation {
 
 impl Library {
     /// A library of `blob` (read from the file when `blob_is_file`), with
-    /// the names known to be in it.
+    /// the names and early keys known to be in it.
     fn new(
         library: ID3D12PipelineLibrary1,
         blob: Vec<u8>,
         names: Names,
+        keys: HashSet<String>,
         file: Option<FileId>,
         blob_is_file: bool,
         previous: Option<Generation>,
@@ -163,6 +177,8 @@ impl Library {
             previous,
             names: RwLock::new(names),
             names_changed: AtomicBool::new(false),
+            keys: Arc::new(RwLock::new(keys)),
+            keys_changed: AtomicBool::new(false),
             file: Mutex::new(file),
             blob_is_file,
         }
@@ -206,18 +222,19 @@ impl Library {
     /// nothing more is stored; one that was tried and failed holds another
     /// entry, and the next slot is tried. A name StorePipeline refuses is
     /// held, by the same rules.
+    /// Returns whether `pso` is now held in the library under a valid slot.
     fn store(
         &self,
         slots: &[(String, HSTRING)],
         failed: &[bool; SLOTS],
         pso: &ID3D12PipelineState,
-    ) {
+    ) -> bool {
         for ((name, wide), &failed) in slots.iter().zip(failed) {
             if self.names().held.contains(name) {
                 if failed {
                     continue;
                 }
-                return;
+                return true;
             }
             // SAFETY: a live pipeline; a name already stored is refused,
             // which leaves the library as it was.
@@ -225,19 +242,19 @@ impl Library {
                 Ok(()) => {
                     self.added.fetch_add(1, Ordering::Relaxed);
                     self.hold(name);
-                    return;
+                    return true;
                 }
                 Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => {
                     self.hold(name);
                     if !failed {
-                        return;
+                        return true;
                     }
                     // Held, and its load failed here: another entry.
                     self.loaded(name, false);
                 }
                 Err(e) => {
                     tracing::debug!(name, error = %e, "host pipeline not stored");
-                    return;
+                    return false;
                 }
             }
         }
@@ -245,6 +262,7 @@ impl Library {
             name = slots[0].0,
             "host pipeline not stored: each of its names is held"
         );
+        false
     }
 }
 
@@ -399,9 +417,78 @@ fn slot(name: &str, k: usize) -> String {
     }
 }
 
+/// The early-key manifest beside a generation's library file
+/// ([`Place::keys`]): lists title-pipeline keys ([`super::make::key`])
+/// known to be stored in that library file, validated against its
+/// [`FileId`].
+const KEYS_FILE: &str = "host-pipelines.keys";
+const KEYS_FORMAT: &str = "xtp pipeline keys 1";
+
+/// Whether `text` is a 32-hex-digit early key ([`super::make::key`]).
+fn is_early_key(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn keys_text(keys: &HashSet<String>, file: &FileId) -> String {
+    let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut text = format!(
+        "{KEYS_FORMAT}\nlibrary {} {}\n",
+        file.bytes,
+        blake3::Hash::from(file.blake3).to_hex()
+    );
+    for key in sorted {
+        text.push_str(key);
+        text.push('\n');
+    }
+    text
+}
+
+/// Reads a keys manifest if it matches `file` (or `blob`, hashing `blob`
+/// only when its size matches and `known` is `None`).
+fn read_keys(text: &str, blob: &[u8], known: Option<FileId>) -> Option<(HashSet<String>, FileId)> {
+    let mut lines = text.lines();
+    if lines.next()? != KEYS_FORMAT {
+        return None;
+    }
+    let mut head = lines.next()?.strip_prefix("library ")?.split(' ');
+    let bytes: u64 = head.next()?.parse().ok()?;
+    let hash = head.next()?;
+    if head.next().is_some() || bytes != blob.len() as u64 {
+        return None;
+    }
+    let file = known.unwrap_or_else(|| FileId::of(blob));
+    (blake3::Hash::from(file.blake3).to_hex().as_str() == hash).then_some(())?;
+    let mut keys = HashSet::new();
+    for line in lines {
+        is_early_key(line).then_some(())?;
+        keys.insert(line.to_owned());
+    }
+    Some((keys, file))
+}
+
+/// Outcome of the most recent [`pipeline`] call on this thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LastPipeline {
+    /// Loaded from the library (or answered via [`without_loading`])
+    /// rather than compiled.
+    pub(crate) hit: bool,
+    /// Held by this process's library (loaded, known, or stored without
+    /// failing).
+    pub(crate) cached: bool,
+}
+
 thread_local! {
     /// Set by [`without_loading`] on the precook's threads.
     static SKIP: Cell<bool> = const { Cell::new(false) };
+    /// Outcome of the most recent [`pipeline`] call on this thread.
+    static LAST: Cell<LastPipeline> = const { Cell::new(LastPipeline { hit: false, cached: false }) };
+}
+
+/// Clears and returns the outcome of the most recent [`pipeline`] call on
+/// this thread.
+pub(crate) fn take_last() -> LastPipeline {
+    LAST.replace(LastPipeline::default())
 }
 
 /// A pipeline of this process, answered for a pipeline the library holds
@@ -457,11 +544,13 @@ fn name_lock(name: &str) -> &'static Mutex<()> {
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 
-/// Where a generation's library file and its names file are.
+/// Where a generation's library file, its names file and its early-key
+/// manifest are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Place {
     library: PathBuf,
     names: PathBuf,
+    keys: PathBuf,
 }
 
 impl Place {
@@ -470,6 +559,7 @@ impl Place {
         Place {
             library: dir.join(format!("host-pipelines-{id}.bin")),
             names: dir.join(format!("host-pipelines-{id}.names")),
+            keys: dir.join(format!("host-pipelines-{id}.keys")),
         }
     }
 
@@ -478,6 +568,7 @@ impl Place {
         Place {
             library: dir.join(LIBRARY_FILE),
             names: dir.join(NAMES_FILE),
+            keys: dir.join(KEYS_FILE),
         }
     }
 }
@@ -658,6 +749,7 @@ fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Set
 /// from: `None` if it starts empty.
 fn seed(dir: &Path, place: &Place, list: &[Lineage]) -> Option<String> {
     let _ = std::fs::remove_file(&place.names);
+    let _ = std::fs::remove_file(&place.keys);
     for g in list {
         let from = Place::of(dir, &g.id);
         if !from.library.exists() {
@@ -728,6 +820,7 @@ fn evict(dir: &Path, list: &mut Vec<Lineage>, kept: usize, budget: u64) -> Vec<S
         match std::fs::remove_file(&place.library) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&place.names);
+                let _ = std::fs::remove_file(&place.keys);
                 tracing::info!(
                     generation = g.id,
                     bytes,
@@ -816,9 +909,15 @@ static REBUILD: AtomicBool = AtomicBool::new(false);
 /// even when the file before was rejected or empty.
 static REBUILT: AtomicBool = AtomicBool::new(false);
 
+static LIBRARY: OnceLock<Option<RwLock<Library>>> = OnceLock::new();
+/// Shared handle to the opened library's early-key set, readable by
+/// [`in_library`] without taking the outer `Library` lock (which saves hold
+/// exclusively while serialising).
+static OPEN_KEYS: OnceLock<Arc<RwLock<HashSet<String>>>> = OnceLock::new();
+
 fn library() -> Option<&'static RwLock<Library>> {
-    static LIBRARY: OnceLock<Option<RwLock<Library>>> = OnceLock::new();
-    LIBRARY
+    let mut wake = false;
+    let lib = LIBRARY
         .get_or_init(|| {
             OPENED.store(true, Ordering::SeqCst);
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
@@ -828,19 +927,68 @@ fn library() -> Option<&'static RwLock<Library>> {
                 .and_then(|p| std::fs::read(&p.library).ok())
                 .unwrap_or_default();
             let names = place.and_then(|p| std::fs::read_to_string(&p.names).ok());
+            let keys = place.and_then(|p| std::fs::read_to_string(&p.keys).ok());
             let library = if REBUILD.load(Ordering::SeqCst) {
                 let library = new_generation(&device, blob, names.as_deref());
                 REBUILT.store(library.is_some(), Ordering::SeqCst);
                 library
             } else {
-                open(&device, blob, names.as_deref())
+                open(&device, blob, names.as_deref(), keys.as_deref())
             };
-            if library.is_none() {
+            if let Some(lib) = &library {
+                let _ = OPEN_KEYS.set(Arc::clone(&lib.keys));
+                wake = !lib
+                    .keys
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+            } else {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
             library.map(RwLock::new)
         })
-        .as_ref()
+        .as_ref();
+    if wake {
+        // Workers sleeping behind `slow_limit` while the library was still
+        // opening can now pick up library hits from `Queues::slow`.
+        super::make::wake_workers();
+    }
+    lib
+}
+
+/// Whether the title pipeline with early key `key` is known to be held by
+/// the already-open pipeline library (never blocks on opening or saving).
+pub(crate) fn in_library(key: &str) -> bool {
+    let Some(keys) = OPEN_KEYS.get() else {
+        return false;
+    };
+    keys.read().unwrap_or_else(|e| e.into_inner()).contains(key)
+}
+
+/// Records that the title pipeline with early key `key` is held by this
+/// generation's pipeline library (loaded from it or stored into it).
+pub(crate) fn note_cached(key: &str) {
+    if !is_early_key(key) {
+        return;
+    }
+    let Some(open_keys) = OPEN_KEYS.get() else {
+        return;
+    };
+    if open_keys
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(key)
+    {
+        return;
+    }
+    let Some(Some(library)) = LIBRARY.get() else {
+        return;
+    };
+    let l = library.read().unwrap_or_else(|e| e.into_inner());
+    let mut keys = l.keys.write().unwrap_or_else(|e| e.into_inner());
+    if keys.insert(key.to_owned()) {
+        l.keys_changed.store(true, Ordering::Release);
+    }
 }
 
 /// Makes the library a new generation, the file's library its generation
@@ -871,8 +1019,14 @@ fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12Pip
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage), with the names `names` (the names
-/// file's text) says it holds if they are that blob's.
-fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Library> {
+/// file's text) and early keys `keys` (the keys manifest's text) it holds
+/// if they are that blob's.
+fn open(
+    device: &ID3D12Device1,
+    blob: Vec<u8>,
+    names: Option<&str>,
+    keys: Option<&str>,
+) -> Option<Library> {
     if !blob.is_empty() {
         match make(device, &blob) {
             Ok(library) => {
@@ -882,11 +1036,18 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Li
                     names = read.as_ref().map(|(n, _)| n.held.len()),
                     "host pipeline library loaded"
                 );
-                let (names, file) = match read {
+                let (names, mut file) = match read {
                     Some((names, file)) => (names, Some(file)),
                     None => (Names::unknown(), None),
                 };
-                return Some(Library::new(library, blob, names, file, true, None));
+                let keys = match keys.and_then(|text| read_keys(text, &blob, file)) {
+                    Some((keys, id)) => {
+                        file = Some(id);
+                        keys
+                    }
+                    None => HashSet::new(),
+                };
+                return Some(Library::new(library, blob, names, keys, file, true, None));
             }
             Err(e) => {
                 tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
@@ -900,6 +1061,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Li
         library,
         Vec::new(),
         Names::empty(),
+        HashSet::new(),
         None,
         false,
         None,
@@ -931,7 +1093,15 @@ fn new_generation(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) ->
         "host pipeline library: a new generation, from the one before"
     );
     let library = make(device, &[]).ok()?;
-    let library = Library::new(library, Vec::new(), Names::empty(), None, false, previous);
+    let library = Library::new(
+        library,
+        Vec::new(),
+        Names::empty(),
+        HashSet::new(),
+        None,
+        false,
+        previous,
+    );
     // Even a generation with no surviving pipelines replaces its file.
     library.added.store(1, Ordering::Relaxed);
     Some(library)
@@ -960,10 +1130,23 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let Some(library) = library() else {
+        LAST.set(LastPipeline::default());
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    found_in(library, name, load, create).map(|(pso, _)| pso)
+    match found_in(library, name, load, create) {
+        Ok((pso, source, cached)) => {
+            LAST.set(LastPipeline {
+                hit: !matches!(source, Source::Made),
+                cached,
+            });
+            Ok(pso)
+        }
+        Err(e) => {
+            LAST.set(LastPipeline::default());
+            Err(e)
+        }
+    }
 }
 
 /// Where a pipeline came from ([`found_in`]).
@@ -991,7 +1174,7 @@ fn found_in(
     name: &str,
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<(ID3D12PipelineState, Source)> {
+) -> windows::core::Result<(ID3D12PipelineState, Source, bool)> {
     if SKIP.get()
         && let Some(stand_in) = STAND_IN.get()
         && library
@@ -1001,7 +1184,7 @@ fn found_in(
             .ready_any(name)
     {
         KNOWN.fetch_add(1, Ordering::Relaxed);
-        return Ok((stand_in.0.clone(), Source::Known));
+        return Ok((stand_in.0.clone(), Source::Known, true));
     }
     let slots: Vec<(String, HSTRING)> = (0..SLOTS)
         .map(|k| {
@@ -1041,7 +1224,7 @@ fn found_in(
                     // Learned, when the names were not all known, and
                     // mended if a load failed before.
                     l.loaded(&slots[k].0, true);
-                    loaded = Some((pso, Source::Library));
+                    loaded = Some((pso, Source::Library, true));
                     break;
                 }
                 Err(_) => {
@@ -1055,8 +1238,8 @@ fn found_in(
         {
             for k in tried(previous.names.as_ref()) {
                 if let Ok(pso) = load(&previous.library, PCWSTR(slots[k].1.as_ptr())) {
-                    l.store(&slots, &failed, &pso);
-                    loaded = Some((pso, Source::Previous));
+                    let stored = l.store(&slots, &failed, &pso);
+                    loaded = Some((pso, Source::Previous, stored));
                     break;
                 }
             }
@@ -1073,9 +1256,9 @@ fn found_in(
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let (_name, l) = take();
-    l.store(&slots, &failed, &pso);
+    let stored = l.store(&slots, &failed, &pso);
     keep_stand_in(&pso);
-    Ok((pso, Source::Made))
+    Ok((pso, Source::Made, stored))
 }
 
 /// For tests: whether `pso` is the stand-in [`without_loading`] answers
@@ -1143,30 +1326,48 @@ pub(crate) fn save(now: bool) -> Saved {
     let mut library_bytes = None;
     let saved = write_library(library, place, now, |bytes| {
         library_bytes = bytes;
-        // Under the save's lock: whether the list changed since the last
-        // save that wrote it.
-        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-        if bytes.is_none() && !used_changed {
+        // Under the save's lock: whether the early or slow list changed
+        // since the last save that wrote it.
+        let used_changed = USED_CHANGED.swap(false, Ordering::AcqRel);
+        let slow_changed = SLOW_CHANGED.swap(false, Ordering::AcqRel);
+        if bytes.is_none() && !used_changed && !slow_changed {
             return Ok(false);
         }
-        let used: Vec<String> = USED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
-        if let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
-            if used_changed {
-                USED_CHANGED.store(true, Ordering::Relaxed);
+        let early_count = if used_changed {
+            let used: Vec<String> = used().iter().flatten().cloned().collect();
+            if let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                USED_CHANGED.store(true, Ordering::Release);
+                if slow_changed {
+                    SLOW_CHANGED.store(true, Ordering::Release);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+            used.len()
+        } else {
+            USED.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(0, HashSet::len)
+        };
+        let slow_count = if slow_changed {
+            let snapshot = slow_ones().clone().unwrap_or_default();
+            if let Err(e) = write_slow(dir, &snapshot) {
+                SLOW_CHANGED.store(true, Ordering::Release);
+                return Err(e);
+            }
+            snapshot.len()
+        } else {
+            SLOW.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(0, HashMap::len)
+        };
         let (created, unkept, distinct) = super::record::created_counts();
         tracing::info!(
             library = bytes.is_some(),
             bytes = bytes.unwrap_or(0),
-            early = used.len(),
+            early = early_count,
+            slow = slow_count,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             known = KNOWN.load(Ordering::Relaxed),
@@ -1232,27 +1433,41 @@ fn write_library(
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let (mapped, added, names) = {
+        let (mapped, added, names, keys) = {
             // Alone: no store between the size and the bytes, nor between
-            // the bytes and the names they hold.
+            // the bytes and the names/keys they hold.
             let l = library.write().unwrap_or_else(|e| e.into_inner());
             let added = l.added.load(Ordering::Relaxed);
             if added == 0 {
-                // The file holds what the library holds: the names learned
-                // since (loads of a library read without them) are its.
+                // The file holds what the library holds: the names and
+                // early keys learned since are its.
                 let names = l
                     .names_changed
                     .swap(false, Ordering::Relaxed)
                     .then(|| l.names().clone());
+                let keys = l
+                    .keys_changed
+                    .swap(false, Ordering::AcqRel)
+                    .then(|| l.keys.read().unwrap_or_else(|e| e.into_inner()).clone());
                 drop(l);
                 if let Some(names) = names {
                     write_names(library, place, &names, None);
                 }
+                if let Some(keys) = keys {
+                    write_keys(library, place, &keys, None);
+                }
                 return Ok(None);
             }
             l.names_changed.store(false, Ordering::Relaxed);
+            l.keys_changed.store(false, Ordering::Release);
             let names = l.names().clone();
-            (LibraryFile::serialize(&tmp, &l.library)?, added, names)
+            let keys = l.keys.read().unwrap_or_else(|e| e.into_inner()).clone();
+            (
+                LibraryFile::serialize(&tmp, &l.library)?,
+                added,
+                names,
+                keys,
+            )
         };
         let size = mapped.size;
         mapped.flush()?;
@@ -1263,6 +1478,11 @@ fn write_library(
         drop(mapped);
         std::fs::rename(&tmp, path)?;
         write_names(library, place, &names, Some(file));
+        if keys.is_empty() {
+            let _ = std::fs::remove_file(&place.keys);
+        } else {
+            write_keys(library, place, &keys, Some(file));
+        }
         Ok(Some((size, added)))
     })();
     let serialised = match serialised {
@@ -1311,6 +1531,35 @@ fn write_names(library: &RwLock<Library>, place: &Place, names: &Names, file: Op
             l.names_changed.store(true, Ordering::Relaxed);
         }
         None => l.names_changed.store(true, Ordering::Relaxed),
+    }
+}
+
+/// Writes the early-key manifest of the library file in `place`, matching
+/// [`write_names`].
+fn write_keys(
+    library: &RwLock<Library>,
+    place: &Place,
+    keys: &HashSet<String>,
+    file: Option<FileId>,
+) {
+    let l = library.read().unwrap_or_else(|e| e.into_inner());
+    let file = {
+        let mut known = l.file.lock().unwrap_or_else(|e| e.into_inner());
+        if file.is_some() {
+            *known = file;
+        } else if known.is_none() && l.blob_is_file {
+            *known = Some(FileId::of(&l._blob));
+        }
+        *known
+    };
+    let written = file.map(|file| write_atomically(&place.keys, keys_text(keys, &file).as_bytes()));
+    match written {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "host pipeline keys not written");
+            l.keys_changed.store(true, Ordering::Relaxed);
+        }
+        None => l.keys_changed.store(true, Ordering::Relaxed),
     }
 }
 
@@ -1407,6 +1656,78 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
+/// How long each title pipeline that took long to make took, in ms (next to
+/// [`EARLY_FILE`]; a key may appear more than once and the maximum stays).
+const SLOW_FILE: &str = "slow-pipelines.txt";
+/// A pipeline that takes this long (in ms) to make is remembered as slow
+/// ([`slow`]).
+pub(crate) const SLOW_MS: u64 = 1000;
+
+static SLOW: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+static SLOW_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn read_slow(dir: &Path) -> HashMap<String, u64> {
+    let Ok(text) = std::fs::read_to_string(dir.join(SLOW_FILE)) else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        if let Some((key, ms)) = line.split_once(' ')
+            && !key.is_empty()
+            && !key.chars().any(char::is_whitespace)
+            && let Ok(ms) = ms.trim().parse::<u64>()
+            && ms >= SLOW_MS
+        {
+            map.entry(key.to_owned())
+                .and_modify(|prev: &mut u64| *prev = (*prev).max(ms))
+                .or_insert(ms);
+        }
+    }
+    map
+}
+
+fn write_slow(dir: &Path, slow: &HashMap<String, u64>) -> std::io::Result<()> {
+    use std::fmt::Write;
+    let mut entries: Vec<(&str, u64)> = slow.iter().map(|(k, &ms)| (k.as_str(), ms)).collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut text = String::new();
+    for (key, ms) in entries {
+        let _ = writeln!(text, "{key} {ms}");
+    }
+    write_atomically(&dir.join(SLOW_FILE), text.as_bytes())
+}
+
+fn slow_ones() -> std::sync::MutexGuard<'static, Option<HashMap<String, u64>>> {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slow.is_none() {
+        *slow = Some(DIR.get().map_or_else(HashMap::new, |d| read_slow(d)));
+    }
+    slow
+}
+
+/// Whether making the title pipeline with `key` took at least [`SLOW_MS`]
+/// in this or an earlier run.
+pub(crate) fn slow(key: &str) -> bool {
+    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+}
+
+/// Records that making the title pipeline with `key` (not a library hit)
+/// took `ms` milliseconds.
+pub(crate) fn note_time(key: &str, ms: u64) {
+    if ms < SLOW_MS || key.is_empty() || key.chars().any(char::is_whitespace) {
+        return;
+    }
+    let mut slow = slow_ones();
+    let known = slow
+        .get_or_insert_default()
+        .entry(key.to_owned())
+        .or_insert(0);
+    if ms > *known {
+        *known = ms;
+        SLOW_CHANGED.store(true, Ordering::Release);
+    }
+}
+
 /// Title pipeline keys drawn or dispatched with (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -1439,7 +1760,7 @@ pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
+        USED_CHANGED.store(true, Ordering::Release);
     }
 }
 
@@ -1476,7 +1797,8 @@ mod tests {
         let device = gpu.device.cast::<ID3D12Device1>().expect("ID3D12Device1");
         // The layer reports the blob it cannot read; the library falls back.
         let library = crate::testgpu::expect_layer_errors(|| {
-            open(&device, b"not a pipeline library".repeat(16), None).expect("an empty library")
+            open(&device, b"not a pipeline library".repeat(16), None, None)
+                .expect("an empty library")
         });
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
@@ -1603,7 +1925,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         // A file where the folder should be.
@@ -1653,7 +1975,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         let (inside, go) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
@@ -1704,7 +2026,7 @@ mod tests {
             );
             std::fs::read(place(dir.path()).library).unwrap()
         };
-        let old = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let old = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Made);
         assert_eq!(ask(&old, &host.device, &b, "b"), Source::Made);
         // Even a matching name must not return a pipeline whose
@@ -1715,7 +2037,7 @@ mod tests {
         let new = RwLock::new(new_generation(&device, saved(&old), None).unwrap());
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Previous);
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Library);
-        let next = RwLock::new(open(&device, saved(&new), None).unwrap());
+        let next = RwLock::new(open(&device, saved(&new), None, None).unwrap());
         assert_eq!(ask(&next, &host.device, &a, "a"), Source::Library);
         assert_eq!(
             ask(&next, &host.device, &b, "b"),
@@ -1723,7 +2045,7 @@ mod tests {
             "not asked for"
         );
         let empty = RwLock::new(new_generation(&device, saved(&next), None).unwrap());
-        let reopened = RwLock::new(open(&device, saved(&empty), None).unwrap());
+        let reopened = RwLock::new(open(&device, saved(&empty), None, None).unwrap());
         assert_eq!(
             ask(&reopened, &host.device, &a, "a"),
             Source::Made,
@@ -1806,7 +2128,7 @@ mod tests {
         let device = host.device.cast::<ID3D12Device1>().unwrap();
         let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
         let name = "00112233445566778899aabbccddeeff";
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
         let other =
             || crate::testgpu::expect_layer_errors(|| ask(&library, &host.device, &b, name));
@@ -1825,7 +2147,7 @@ mod tests {
         let blob = std::fs::read(place(dir.path()).library).unwrap();
         let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
         assert_eq!(Names::read(&text, &blob), Some((held, FileId::of(&blob))));
-        let reopened = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let reopened = RwLock::new(open(&device, blob, Some(&text), None).unwrap());
         let other =
             || crate::testgpu::expect_layer_errors(|| ask(&reopened, &host.device, &b, name));
         assert_eq!(other(), Source::Library, "repaired for the next process");
@@ -1854,7 +2176,7 @@ mod tests {
             "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
         );
         let dir = tempfile::tempdir().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name_a), Source::Made);
         assert_eq!(
             write_library(&library, &place(dir.path()), true, |_| Ok(true)),
@@ -1867,7 +2189,7 @@ mod tests {
         // count is the process's: other tests' precooks, the replay's,
         // may add to it meanwhile. `Source::Known` says this ask's.)
         let known = KNOWN.load(Ordering::Relaxed);
-        let named = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let named = RwLock::new(open(&device, blob.clone(), Some(&text), None).unwrap());
         assert_eq!(
             without_loading(|| ask(&named, &host.device, &a, name_a)),
             Source::Known
@@ -1884,7 +2206,7 @@ mod tests {
         );
 
         // Read without its names (an older file): loaded once, then known.
-        let unnamed = RwLock::new(open(&device, blob, None).unwrap());
+        let unnamed = RwLock::new(open(&device, blob, None, None).unwrap());
         assert_eq!(
             without_loading(|| ask(&unnamed, &host.device, &a, name_a)),
             Source::Library
@@ -1934,13 +2256,13 @@ mod tests {
             (blob, text)
         };
         // The library's entry of the name is another description's.
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
         let (blob, text) = saved(&library);
 
         // A session's load of `b` by that name fails, and its compile too
         // (nothing goes under the next name): the names file says broken.
-        let session = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let session = RwLock::new(open(&device, blob.clone(), Some(&text), None).unwrap());
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a copy of a live root signature, not released by the
             // description.
@@ -1968,7 +2290,7 @@ mod tests {
 
         // The precook does not answer by it: it loads, then makes `b`,
         // under the next name.
-        let precook = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let precook = RwLock::new(open(&device, blob, Some(&text), None).unwrap());
         let made = crate::testgpu::expect_layer_errors(|| {
             without_loading(|| ask(&precook, &host.device, &b, name))
         });
@@ -1990,7 +2312,7 @@ mod tests {
 
         // A session after it loads `b` by the next name; `a` still loads
         // by its own, which mends it.
-        let next = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let next = RwLock::new(open(&device, blob, Some(&text), None).unwrap());
         let found = crate::testgpu::expect_layer_errors(|| ask(&next, &host.device, &b, name));
         assert_eq!(found, Source::Library);
         assert_eq!(ask(&next, &host.device, &a, name), Source::Library);
@@ -2241,5 +2563,175 @@ mod tests {
         let a = settle(d, A, 10, u64::MAX).unwrap();
         assert_eq!(a.lineage, Lineage::own(A));
         assert_eq!(ids(&read_generations(d)), [A, E]);
+    }
+
+    /// The slow-pipelines file round-trips cleanly: entries are written
+    /// sorted, read back identically, duplicate keys keep their longest
+    /// time, and malformed lines are ignored.
+    #[test]
+    fn slow_pipelines_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_slow(dir.path()).is_empty(), "missing file");
+
+        let mut slow = HashMap::new();
+        slow.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(), 1_500);
+        slow.insert("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(), 4_200);
+        write_slow(dir.path(), &slow).unwrap();
+        assert_eq!(read_slow(dir.path()), slow);
+
+        // Duplicate keys keep the longest measured duration; entries below
+        // `SLOW_MS` and malformed lines are skipped without losing valid ones.
+        let path = dir.path().join(SLOW_FILE);
+        std::fs::write(
+            &path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1200\r\n\
+             not-a-valid-line\r\n\
+              9999\r\n\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 3800\r\n\
+             cccccccccccccccccccccccccccccccc nope\r\n\
+             dddddddddddddddddddddddddddddddd 999\r\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2000\r\n",
+        )
+        .unwrap();
+        let read = read_slow(dir.path());
+        assert_eq!(read.len(), 2);
+        assert_eq!(read["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], 3_800);
+        assert_eq!(read["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], 2_000);
+
+        // `note_time` records only durations at or above `SLOW_MS` and
+        // rejects keys containing whitespace.
+        let fast = "11111111111111111111111111111111";
+        let lagged = "22222222222222222222222222222222";
+        note_time(fast, SLOW_MS - 1);
+        assert!(!super::slow(fast));
+        note_time("bad key", SLOW_MS);
+        assert!(!super::slow("bad key"));
+        note_time("", SLOW_MS);
+        assert!(!super::slow(""));
+        note_time(lagged, SLOW_MS);
+        assert!(super::slow(lagged));
+    }
+
+    /// An early-key manifest reads back only for its own library file, and
+    /// is not copied across translator generations when seeding.
+    #[test]
+    fn keys_manifest_matches_its_own_file_only() {
+        let blob = b"a serialised pipeline library".repeat(8);
+        let file = FileId::of(&blob);
+        let a = "0123456789abcdef0123456789abcdef".to_owned();
+        let b = "fedcba9876543210fedcba9876543210".to_owned();
+        let keys: HashSet<String> = [a.clone(), b].into();
+        let text = keys_text(&keys, &file);
+        assert_eq!(
+            read_keys(&text, &blob, Some(file)),
+            Some((keys.clone(), file))
+        );
+        assert_eq!(read_keys(&text, &blob, None), Some((keys, file)));
+        let mut other = blob.clone();
+        other[0] ^= 1;
+        assert_eq!(read_keys(&text, &other, None), None, "other bytes");
+        assert_eq!(read_keys(&text, &blob[1..], None), None, "other size");
+        assert_eq!(
+            read_keys(&format!("{text}not-a-key\n"), &blob, Some(file)),
+            None
+        );
+
+        // Seeding a new generation does not copy the old generation's keys
+        // manifest, and eviction removes it.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let g1 = settle(d, A, 2, u64::MAX).unwrap();
+        save_as(&g1.place, &blob, "names");
+        write_atomically(&g1.place.keys, text.as_bytes()).unwrap();
+        let g2 = settle(d, B, 2, u64::MAX).unwrap();
+        assert!(!g2.place.keys.exists(), "not copied to new translator");
+        save_as(&g2.place, &blob, "names");
+        let _g3 = settle(d, C, 2, u64::MAX).unwrap();
+        assert!(!g1.place.keys.exists(), "removed on eviction");
+    }
+
+    /// A pipeline that could not be stored (all alternate slots occupied by
+    /// other descriptions) is not reported as cached, and a library's shared
+    /// key set stays readable while the outer library lock is held for saving.
+    #[test]
+    fn unstored_pipeline_is_not_reported_cached_and_keys_stay_readable_during_save() {
+        let test = "pipeline::library::tests::unstored_pipeline_is_not_reported_cached_and_keys_stay_readable_during_save";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let library = RwLock::new(open(&device, Vec::new(), None, None).unwrap());
+        let name = "1234567890abcdef1234567890abcdef";
+        let ask_cached = |k: &Kernel, n: &str| {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: a copy of a live root signature, not released by the
+                // description.
+                pRootSignature: unsafe { std::mem::transmute_copy(&k.root) },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: k.code.as_ptr().cast(),
+                    BytecodeLength: k.code.len(),
+                },
+                ..Default::default()
+            };
+            let (_, source, cached) = found_in(
+                &library,
+                n,
+                // SAFETY: the description points at live data.
+                |l, name| unsafe { l.LoadComputePipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateComputePipelineState(&desc) },
+            )
+            .unwrap();
+            (source, cached)
+        };
+
+        // Fill all `SLOTS` with distinct descriptions under the same name.
+        for i in 0..SLOTS {
+            let k = kernel(&host.device, (i as u32) + 1);
+            let (source, cached) = crate::testgpu::expect_layer_errors(|| ask_cached(&k, name));
+            assert_eq!(source, Source::Made);
+            assert!(cached, "slot {i} was stored");
+        }
+        // One more incompatible description under the same name has no slot
+        // left: it compiles, but must not be reported as cached in the library.
+        let overflow = kernel(&host.device, (SLOTS as u32) + 1);
+        let (source, cached) = crate::testgpu::expect_layer_errors(|| ask_cached(&overflow, name));
+        assert_eq!(source, Source::Made);
+        assert!(!cached, "no slot left: not stored in library");
+
+        // The shared keys set stays readable even while `library.write()` is
+        // held exclusively (as during `LibraryFile::serialize`).
+        let shared_keys = {
+            let l = library.read().unwrap();
+            l.keys
+                .write()
+                .unwrap()
+                .insert("abcdef0123456789abcdef0123456789".to_owned());
+            Arc::clone(&l.keys)
+        };
+        let _saving = library.write().unwrap();
+        assert!(
+            shared_keys
+                .read()
+                .unwrap()
+                .contains("abcdef0123456789abcdef0123456789")
+        );
+        drop(_saving);
+
+        // Saving a library whose keys set is empty removes any stale `.keys`
+        // file beside it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = place(dir.path());
+        std::fs::write(&p.keys, "stale").unwrap();
+        library.read().unwrap().keys.write().unwrap().clear();
+        assert_eq!(
+            write_library(&library, &p, true, |_| Ok(true)),
+            Saved::Written
+        );
+        assert!(
+            !p.keys.exists(),
+            "stale keys file removed on empty keys save"
+        );
     }
 }
