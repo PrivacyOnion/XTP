@@ -81,7 +81,6 @@
 //!   has loaded yet cannot be known to fail without a load: the session
 //!   that first finds such an entry makes the pipeline beside it and says
 //!   so in the names file, and the precooks after it count it no more.
-
 //! - The library file is mapped read-only rather than read into a heap buffer
 //!   ([`Blob`]): D3D12 reads the bytes for as long as the library lives, so
 //!   mapping keeps the file out of private commit and lets Windows reclaim clean
@@ -143,7 +142,7 @@ fn mapped() -> bool {
 struct Mapped {
     at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
-    _file: Option<std::fs::File>,
+    _file: std::fs::File,
 }
 
 // SAFETY: the read-only view and held file handle can be moved between threads.
@@ -152,8 +151,9 @@ unsafe impl Send for Mapped {}
 unsafe impl Sync for Mapped {}
 
 impl Mapped {
-    /// Maps `file` (`len` bytes, non-zero) read-only.
-    fn map(file: &std::fs::File, len: usize) -> Option<Mapped> {
+    /// Maps `file` (`len` bytes, non-zero) read-only and keeps `file` open
+    /// until the view is unmapped.
+    fn map(file: std::fs::File, len: usize) -> Option<Mapped> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
@@ -182,31 +182,31 @@ impl Mapped {
         (!at.Value.is_null()).then_some(Mapped {
             at,
             len,
-            _file: None,
+            _file: file,
         })
     }
 
     /// Maps `path` read-only while holding its file handle open.
     fn open(path: &Path) -> Option<Mapped> {
-        Mapped::open_holding(path, true)
-    }
-
-    /// Maps `path` read-only; `hold` controls whether the file handle stays open
-    /// until the view is unmapped.
-    fn open_holding(path: &Path, hold: bool) -> Option<Mapped> {
-        // Opened with standard Rust sharing (read, write, delete), so a save can
-        // rename a new library over this file while it remains mapped.
-        let file = std::fs::File::open(path).ok()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        // Share read and delete (for rename-over-mapped saves, hard links, and
+        // concurrent readers) but not write, so nothing can mutate the mapped
+        // bytes in place while the read-only view is live.
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_DELETE: u32 = 4;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
-        let mut mapped = Mapped::map(&file, len)?;
-        if hold {
-            mapped._file = Some(file);
-        }
-        Some(mapped)
+        Mapped::map(file, len)
     }
 
     fn bytes(&self) -> &[u8] {
-        // SAFETY: the view holds len readable bytes until dropped.
+        // SAFETY: the read-only view holds `len` readable bytes until dropped,
+        // and the file was opened without `FILE_SHARE_WRITE` so no handle can
+        // mutate the backing file in place while `_file` is held open.
         unsafe { std::slice::from_raw_parts(self.at.Value.cast(), self.len) }
     }
 }
@@ -234,10 +234,12 @@ impl Blob {
     /// Opens the library file in `place`, adopting any pending `.next` file
     /// first. Maps it read-only unless `XTP_LIBRARY_MAP=0` or mapping fails.
     fn open(place: &Place) -> Blob {
+        Blob::open_in(place, mapped())
+    }
+
+    fn open_in(place: &Place, map: bool) -> Blob {
         adopt_next(place);
-        if mapped()
-            && let Some(file) = Mapped::open(&place.library)
-        {
+        if map && let Some(file) = Mapped::open(&place.library) {
             return Blob::Mapped(file);
         }
         match std::fs::read(&place.library) {
@@ -270,34 +272,149 @@ impl Blob {
     }
 }
 
-/// The static library's mapped view (address, length; 0 when unmapped), when a
-/// pipeline was last looked up in the library (`crate::host::now_ms`), and
-/// whether the view has already been trimmed since that lookup.
-static VIEW: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
-static LOADED_AT: AtomicU64 = AtomicU64::new(0);
-static TRIMMED: AtomicBool = AtomicBool::new(false);
+/// State tracking idle working-set trimming of a process-lifetime mapped view.
+struct TrimState {
+    /// Mapped view base address (0 when unmapped) and length in bytes.
+    view_at: AtomicUsize,
+    view_len: AtomicUsize,
+    /// Monotonic latest timestamp (`crate::host::now_ms`) when the mapped view
+    /// was touched.
+    loaded_at: AtomicU64,
+    /// Monotonic touch counter incremented on every touch (starts at 1 on
+    /// register) so trims cannot lose a re-arm or race on equal timestamps.
+    touch_seq: AtomicU64,
+    /// When `begin` last evaluated the idle threshold (rate-limited to 1 Hz).
+    checked_at: AtomicU64,
+    /// Packs `(trimmed_seq << 1) | running`, where bit 0 is 1 while a trim
+    /// worker thread is in flight and the upper 63 bits hold the latest
+    /// `touch_seq` for which a trim has been claimed.
+    state: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrimClaim {
+    at: usize,
+    len: usize,
+    prev_state: u64,
+}
+
+impl TrimState {
+    const RUNNING: u64 = 1;
+
+    const fn new() -> Self {
+        Self {
+            view_at: AtomicUsize::new(0),
+            view_len: AtomicUsize::new(0),
+            loaded_at: AtomicU64::new(0),
+            touch_seq: AtomicU64::new(0),
+            checked_at: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        }
+    }
+
+    fn register(&self, at: usize, len: usize, now: u64) {
+        self.view_len.store(len, Ordering::Relaxed);
+        self.loaded_at.store(now, Ordering::Relaxed);
+        self.touch_seq.store(1, Ordering::Relaxed);
+        self.state.store(0, Ordering::Relaxed);
+        self.view_at.store(at, Ordering::Release);
+    }
+
+    /// Notes that the mapped view at `at` was read, advancing the idle timer
+    /// monotonically and re-arming trimming if `at` matches the registered view.
+    fn note_touched(&self, at: usize, now: u64) {
+        if at != 0 && self.view_at.load(Ordering::Acquire) == at {
+            self.loaded_at.fetch_max(now, Ordering::Release);
+            self.touch_seq.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Claims a trim when the view is mapped, has been idle for at least
+    /// `quiet_ms()`, has been touched since the last trim, and no trim thread
+    /// is in flight. Rate-limited to once per second.
+    fn begin(
+        &self,
+        now_fn: impl FnOnce() -> u64,
+        quiet_ms: impl FnOnce() -> u64,
+    ) -> Option<TrimClaim> {
+        let at = self.view_at.load(Ordering::Acquire);
+        if at == 0 {
+            return None;
+        }
+        let state = self.state.load(Ordering::Acquire);
+        let seq = self.touch_seq.load(Ordering::Acquire);
+        if (state & Self::RUNNING) != 0 || (state >> 1) >= seq {
+            return None;
+        }
+        let now = now_fn();
+        let checked = self.checked_at.load(Ordering::Relaxed);
+        if now < checked.saturating_add(1000)
+            || self
+                .checked_at
+                .compare_exchange(checked, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        let seq = self.touch_seq.load(Ordering::Acquire);
+        let loaded_at = self.loaded_at.load(Ordering::Acquire);
+        if now < loaded_at.saturating_add(quiet_ms()) {
+            return None;
+        }
+        let mut cur = self.state.load(Ordering::Acquire);
+        loop {
+            if (cur & Self::RUNNING) != 0 || (cur >> 1) >= seq {
+                return None;
+            }
+            // Cancel if another thread touched the view while `quiet_ms` ran.
+            if self.touch_seq.load(Ordering::Acquire) != seq {
+                return None;
+            }
+            let next = (seq << 1) | Self::RUNNING;
+            match self
+                .state
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Some(TrimClaim {
+                        at,
+                        len: self.view_len.load(Ordering::Relaxed),
+                        prev_state: cur,
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.state.fetch_and(!Self::RUNNING, Ordering::Release);
+    }
+
+    fn abort_spawn(&self, prev_state: u64) {
+        // Exclusive holder of `RUNNING`: restoring `prev_state` clears
+        // `RUNNING` and restores the previous `trimmed_seq` without racing
+        // with `note_touched` (which only updates `loaded_at` and `touch_seq`).
+        self.state.store(prev_state, Ordering::Release);
+    }
+}
+
+static TRIM: TrimState = TrimState::new();
 
 /// Records the static library's mapped view so [`trim`] can drop its pages
 /// from the working set once loads go idle. Must only be called for the
 /// process-lifetime library stored in [`library`].
 fn register_mapped_view(lib: &Library) {
-    let view = lib
-        ._blob
-        .mapped_view()
-        .or_else(|| lib.previous.as_ref().and_then(|g| g._blob.mapped_view()));
-    if let Some((at, len)) = view {
-        VIEW[1].store(len, Ordering::Relaxed);
-        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        VIEW[0].store(at, Ordering::Release);
+    if let Some((at, len)) = lib.mapped_view() {
+        TRIM.register(at, len, crate::host::now_ms());
     }
 }
 
-/// Notes that a library lookup touched the library bytes, resetting the idle
-/// trim timer.
-fn note_loaded() {
-    if VIEW[0].load(Ordering::Relaxed) != 0 {
-        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        TRIMMED.store(false, Ordering::Relaxed);
+/// Notes that a read touched `blob` (load, serialization, or hashing),
+/// resetting the idle trim timer if it is the registered static view.
+fn note_blob_touched(blob: &Blob) {
+    if let Some((at, _)) = blob.mapped_view() {
+        TRIM.note_touched(at, crate::host::now_ms());
     }
 }
 
@@ -310,31 +427,23 @@ fn note_loaded() {
 /// `XTP_LIBRARY_TRIM=0` disables trimming.
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
-    static CHECKED: AtomicU64 = AtomicU64::new(0);
-    let at = VIEW[0].load(Ordering::Acquire);
-    if at == 0
-        || TRIMMED.load(Ordering::Relaxed)
-        || !*ON.get_or_init(|| std::env::var_os("XTP_LIBRARY_TRIM").is_none_or(|v| v != "0"))
-    {
+    if !*ON.get_or_init(|| std::env::var_os("XTP_LIBRARY_TRIM").is_none_or(|v| v != "0")) {
         return;
     }
-    let now = crate::host::now_ms();
-    let checked = CHECKED.load(Ordering::Relaxed);
-    if now < checked.saturating_add(1000)
-        || CHECKED
-            .compare_exchange(checked, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-    {
+    let Some(claim) = TRIM.begin(crate::host::now_ms, || {
+        crate::host::ram_idle_ms(crate::host::available_physical_ram())
+    }) else {
         return;
+    };
+    struct RunningGuard;
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            TRIM.finish();
+        }
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    if now < LOADED_AT.load(Ordering::Relaxed).saturating_add(quiet_ms)
-        || TRIMMED.swap(true, Ordering::Relaxed)
-    {
-        return;
-    }
-    let len = VIEW[1].load(Ordering::Relaxed);
+    let (at, len) = (claim.at, claim.len);
     let work = move || {
+        let _guard = RunningGuard;
         // SAFETY: the view belongs to the static pipeline library and stays
         // mapped for the rest of the process; unlocking unlocked pages is
         // documented to fail and drop them from the working set.
@@ -349,7 +458,7 @@ pub(crate) fn trim() {
         .spawn(work)
         .is_err()
     {
-        TRIMMED.store(false, Ordering::Relaxed);
+        TRIM.abort_spawn(claim.prev_state);
     }
 }
 
@@ -407,6 +516,12 @@ impl Library {
 
     fn names(&self) -> std::sync::RwLockReadGuard<'_, Names> {
         self.names.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn mapped_view(&self) -> Option<(usize, usize)> {
+        self._blob
+            .mapped_view()
+            .or_else(|| self.previous.as_ref().and_then(|g| g._blob.mapped_view()))
     }
 
     /// `name` is held: stored by this process, refused by StorePipeline as
@@ -728,13 +843,13 @@ impl Place {
 /// Renames a pending `.next` library file over `place.library` if present.
 fn adopt_next(place: &Place) {
     let next = place.next();
-    if next.exists()
-        && let Err(e) = std::fs::rename(&next, &place.library)
-    {
-        tracing::warn!(
+    match std::fs::rename(&next, &place.library) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
             error = %e,
             "host pipeline library saved last could not take the old one's place"
-        );
+        ),
     }
 }
 
@@ -877,12 +992,15 @@ fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Set
     let mut found: Vec<String> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter_map(|n| {
-            let id = n.strip_prefix("host-pipelines-")?.strip_suffix(".bin")?;
+            let id = n
+                .strip_prefix("host-pipelines-")
+                .and_then(|s| s.strip_suffix(".bin").or_else(|| s.strip_suffix(".next")))?;
             is_id(id).then(|| id.to_owned())
         })
         .filter(|id| !list.iter().any(|g| g.id == *id))
         .collect();
     found.sort_unstable();
+    found.dedup();
     list.extend(found.iter().map(|id| Lineage::own(id)));
     let place = Place::of(dir, id);
     adopt_next(&place);
@@ -969,25 +1087,35 @@ fn evict(dir: &Path, list: &mut Vec<Lineage>, kept: usize, budget: u64) -> Vec<S
     let (mut count, mut total) = (0usize, 0u64);
     list.retain(|g| {
         let place = Place::of(dir, &g.id);
-        let bytes = std::fs::metadata(&place.library).map(|m| m.len());
+        let lib = std::fs::metadata(&place.library).ok().map(|m| m.len());
+        let next = std::fs::metadata(place.next()).ok().map(|m| m.len());
+        let bytes = match (lib, next) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        };
         let first = count == 0;
         if first {
             count += 1;
             total = bytes.unwrap_or(0);
             return true;
         }
-        let Ok(bytes) = bytes else {
+        let Some(bytes) = bytes else {
             return false;
         };
         if count < kept && total.saturating_add(bytes) <= budget {
             count += 1;
-            total += bytes;
+            total = total.saturating_add(bytes);
             return true;
         }
-        match std::fs::remove_file(&place.library) {
+        let remove = |path: &Path| match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        let removed = remove(&place.library).and_then(|()| remove(&place.next()));
+        match removed {
             Ok(()) => {
                 let _ = std::fs::remove_file(&place.names);
-                let _ = std::fs::remove_file(place.next());
                 tracing::info!(
                     generation = g.id,
                     bytes,
@@ -1111,12 +1239,19 @@ pub(crate) fn rebuild() -> bool {
     !OPENED.load(Ordering::SeqCst)
 }
 
+/// The size of `place`'s latest library file on disk (preferring a pending
+/// `.next` file written when replacing a mapped `.bin` fell back).
+fn file_bytes_at(place: &Place) -> Option<u64> {
+    std::fs::metadata(place.next())
+        .or_else(|_| std::fs::metadata(&place.library))
+        .ok()
+        .map(|m| m.len())
+}
+
 /// The size of this process's generation's library file, if there is one
 /// (settled first: [`current`]).
 pub(crate) fn file_bytes() -> Option<u64> {
-    std::fs::metadata(&current()?.place.library)
-        .ok()
-        .map(|m| m.len())
+    file_bytes_at(&current()?.place)
 }
 
 /// The host's library of `bytes`, which must outlive it.
@@ -1185,6 +1320,7 @@ fn new_generation(device: &ID3D12Device1, blob: Blob, names: Option<&str>) -> Op
             }),
             Err(e) => {
                 tracing::info!(error = %e, "host pipeline library rejected: the new generation starts from nothing");
+                drop(blob);
                 None
             }
         }
@@ -1300,38 +1436,39 @@ fn found_in(
         let (_name, l) = take();
         let started = std::time::Instant::now();
         let mut loaded = None;
-        let mut touched = false;
         let ours = tried(Some(&l.names()));
-        for k in ours {
-            touched = true;
-            match load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
+        for k in &ours {
+            match load(&l.library, PCWSTR(slots[*k].1.as_ptr())) {
                 Ok(pso) => {
                     // Learned, when the names were not all known, and
                     // mended if a load failed before.
-                    l.loaded(&slots[k].0, true);
+                    l.loaded(&slots[*k].0, true);
                     loaded = Some((pso, Source::Library));
                     break;
                 }
                 Err(_) => {
-                    failed[k] = true;
-                    l.loaded(&slots[k].0, false);
+                    failed[*k] = true;
+                    l.loaded(&slots[*k].0, false);
                 }
             }
+        }
+        if !ours.is_empty() {
+            note_blob_touched(&l._blob);
         }
         if loaded.is_none()
             && let Some(previous) = &l.previous
         {
-            for k in tried(previous.names.as_ref()) {
-                touched = true;
-                if let Ok(pso) = load(&previous.library, PCWSTR(slots[k].1.as_ptr())) {
+            let prev = tried(previous.names.as_ref());
+            for k in &prev {
+                if let Ok(pso) = load(&previous.library, PCWSTR(slots[*k].1.as_ptr())) {
                     l.store(&slots, &failed, &pso);
                     loaded = Some((pso, Source::Previous));
                     break;
                 }
             }
-        }
-        if touched {
-            note_loaded();
+            if !prev.is_empty() {
+                note_blob_touched(&previous._blob);
+            }
         }
         LOAD_US.fetch_add(since(started), Ordering::Relaxed);
         loaded
@@ -1524,7 +1661,9 @@ fn write_library(
             }
             l.names_changed.store(false, Ordering::Relaxed);
             let names = l.names().clone();
-            (LibraryFile::serialize(&tmp, &l.library)?, added, names)
+            let file = LibraryFile::serialize(&tmp, &l.library);
+            note_blob_touched(&l._blob);
+            (file?, added, names)
         };
         let size = mapped.size;
         mapped.flush()?;
@@ -1572,6 +1711,7 @@ fn write_names(library: &RwLock<Library>, place: &Place, names: &Names, file: Op
             *known = file;
         } else if known.is_none() && l.blob_is_file {
             *known = Some(FileId::of(l._blob.bytes()));
+            note_blob_touched(&l._blob);
         }
         *known
     };
@@ -1679,7 +1819,15 @@ impl Drop for LibraryFile {
 fn replace_library(place: &Place, tmp: &Path) -> std::io::Result<bool> {
     match std::fs::rename(tmp, &place.library) {
         Ok(()) => {
-            let _ = std::fs::remove_file(place.next());
+            if let Err(e) = std::fs::remove_file(place.next())
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    next = %place.next().display(),
+                    error = %e,
+                    "stale host pipeline library .next file could not be removed"
+                );
+            }
             Ok(true)
         }
         Err(_) => {
@@ -2562,6 +2710,22 @@ mod tests {
         assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
         assert_eq!(blob.bytes(), &old[..]);
 
+        // While mapped, in-place write opens are rejected (protecting `&[u8]`
+        // soundness), whereas hard-link seeding and concurrent reads succeed.
+        if matches!(blob, Blob::Mapped(_)) {
+            assert!(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&p.library)
+                    .is_err(),
+                "mapped library must exclude FILE_SHARE_WRITE"
+            );
+            let linked = dir.path().join("seeded-hardlink.bin");
+            std::fs::hard_link(&p.library, &linked).unwrap();
+            assert_eq!(std::fs::read(&linked).unwrap(), old);
+            std::fs::remove_file(&linked).unwrap();
+        }
+
         // Replace while the old file is mapped.
         let tmp = p.library.with_extension("tmp");
         let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
@@ -2591,6 +2755,159 @@ mod tests {
         let adopted = Blob::open(&p);
         assert_eq!(adopted.bytes(), &newer[..]);
         assert!(!p.next().exists());
+
+        // A later in-place replacement removes any stale `.next` file.
+        let latest: Vec<u8> = (0..100_000u32).map(|i| (i * 3) as u8).collect();
+        std::fs::write(p.next(), b"stale next").unwrap();
+        std::fs::write(&tmp, &latest).unwrap();
+        assert!(replace_library(&p, &tmp).unwrap());
+        assert!(!p.next().exists());
+        assert_eq!(Blob::open(&p).bytes(), &latest[..]);
+
+        // Unmapped fallback (`XTP_LIBRARY_MAP=0` path) still adopts `.next`
+        // and reads into `Blob::Held`.
+        let held_next: Vec<u8> = (0..50_000u32).map(|i| (i * 5) as u8).collect();
+        std::fs::write(p.next(), &held_next).unwrap();
+        let held = Blob::open_in(&p, false);
+        assert!(matches!(held, Blob::Held(_)));
+        assert_eq!(held.bytes(), &held_next[..]);
+        assert!(!p.next().exists());
+    }
+
+    #[test]
+    fn next_files_integrate_with_generations_and_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Generation A only has `.next` (no `.bin`) and no generations.txt:
+        // settle discovers it via `.next`, adopts it, and keeps it without re-seeding.
+        let pa = Place::of(d, A);
+        std::fs::write(pa.next(), b"generation A via next").unwrap();
+        let sa = settle(d, A, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert!(!sa.new);
+        assert!(pa.library.exists());
+        assert!(!pa.next().exists());
+        assert_eq!(
+            std::fs::read(&pa.library).unwrap(),
+            b"generation A via next"
+        );
+
+        // `file_bytes_at` prefers `.next` when present.
+        assert_eq!(
+            file_bytes_at(&pa),
+            Some(b"generation A via next".len() as u64)
+        );
+        std::fs::write(pa.next(), b"newer A").unwrap();
+        assert_eq!(file_bytes_at(&pa), Some(b"newer A".len() as u64));
+
+        // Seeding B adopts A's pending `.next` before linking/copying.
+        let sb = settle(d, B, GENERATIONS_KEPT, u64::MAX).unwrap();
+        assert_eq!(sb.lineage.from.as_deref(), Some(A));
+        assert!(!pa.next().exists());
+        assert_eq!(std::fs::read(&sb.place.library).unwrap(), b"newer A");
+
+        // Eviction counts `.next` size toward budget and removes `.next`, `.bin`, `.names`.
+        std::fs::write(pa.next(), [0x55u8; 200]).unwrap();
+        std::fs::write(&pa.names, "names A").unwrap();
+        let sc = settle(d, C, 10, 100).unwrap();
+        assert!(sc.evicted.contains(&A.to_owned()));
+        assert!(!pa.library.exists());
+        assert!(!pa.next().exists());
+        assert!(!pa.names.exists());
+    }
+
+    #[test]
+    fn trim_state_arms_rate_limits_and_rearms_on_touch() {
+        let state = TrimState::new();
+        // Unmapped view returns None without querying clock or memory.
+        assert_eq!(
+            state.begin(|| panic!("clock should not be queried"), || 2_000),
+            None
+        );
+
+        state.register(0x1000, 4096, 100);
+        // Rate-limited until 1000 ms has elapsed from initial checked_at (0).
+        assert_eq!(state.begin(|| 500, || 2_000), None);
+        // Past 1000 ms, checked_at advances, but idle threshold (100 + 2000) not met.
+        assert_eq!(state.begin(|| 1_500, || 2_000), None);
+        // Rate-limited within 1000 ms of 1500.
+        assert_eq!(state.begin(|| 2_499, || 2_000), None);
+        // Past idle threshold: begins trim once.
+        let claim = state.begin(|| 2_500, || 2_000).expect("first trim claim");
+        assert_eq!((claim.at, claim.len), (0x1000, 4096));
+        // Already running: returns None without querying clock, even if touched.
+        assert_eq!(
+            state.begin(
+                || panic!("clock should not be queried while running"),
+                || 2_000
+            ),
+            None
+        );
+        // A touch arriving while the trim thread is running does not allow a
+        // concurrent trim, and re-arms a fresh trim once `finish()` runs.
+        state.note_touched(0x1000, 3_000);
+        assert_eq!(
+            state.begin(|| panic!("no concurrent trim while running"), || 2_000),
+            None
+        );
+        state.finish();
+        // Still needs `quiet_ms` after the 3_000 touch.
+        assert_eq!(state.begin(|| 4_500, || 2_000), None);
+        let claim = state
+            .begin(|| 5_500, || 2_000)
+            .expect("re-armed after in-flight touch");
+        assert_eq!((claim.at, claim.len), (0x1000, 4096));
+        // After abort_spawn, previous state is restored and retry succeeds after 1 s.
+        state.abort_spawn(claim.prev_state);
+        let claim = state.begin(|| 6_500, || 2_000).expect("retry after abort");
+        assert_eq!((claim.at, claim.len), (0x1000, 4096));
+        state.finish();
+
+        // Already trimmed for this touch_seq: returns None without querying clock.
+        assert_eq!(
+            state.begin(
+                || panic!("clock should not be queried while trimmed"),
+                || 2_000
+            ),
+            None
+        );
+
+        // Touching an unrelated view address does not re-arm.
+        state.note_touched(0x2000, 7_000);
+        assert_eq!(
+            state.begin(|| panic!("unrelated touch must not re-arm"), || 2_000),
+            None
+        );
+
+        // Stale out-of-order touch timestamp cannot move `loaded_at` backwards.
+        state.note_touched(0x1000, 9_000);
+        state.note_touched(0x1000, 4_000);
+        assert_eq!(state.begin(|| 10_500, || 2_000), None);
+        let claim = state
+            .begin(|| 11_500, || 2_000)
+            .expect("trim after monotonic loaded_at");
+        assert_eq!((claim.at, claim.len), (0x1000, 4096));
+        state.finish();
+
+        // Touch racing with begin's quiet_ms check cancels trim and leaves it armed.
+        state.note_touched(0x1000, 12_000);
+        assert_eq!(
+            state.begin(
+                || 15_000,
+                || {
+                    state.note_touched(0x1000, 14_500);
+                    2_000
+                }
+            ),
+            None
+        );
+        assert_eq!(state.begin(|| 15_500, || 2_000), None);
+        assert_eq!(state.begin(|| 16_499, || 2_000), None);
+        let claim = state
+            .begin(|| 17_499, || 2_000)
+            .expect("trim after racing touch settles");
+        assert_eq!((claim.at, claim.len), (0x1000, 4096));
+        state.finish();
     }
 
     fn pattern(at: usize, out: &mut [u8]) {
@@ -2642,7 +2959,7 @@ mod tests {
         if !write_uncached(&p.library, LEN) {
             return;
         }
-        let mapped = Mapped::open_holding(&p.library, true).expect("mapped library file");
+        let mapped = Mapped::open(&p.library).expect("mapped library file");
         let tmp = p.library.with_extension("tmp");
         std::fs::write(&tmp, vec![0xEE; LEN]).unwrap();
         replace_library(&p, &tmp).unwrap();
@@ -2719,14 +3036,56 @@ mod tests {
         assert_eq!(ask(&final_lib, &host.device, &a, name_a), Source::Library);
         assert_eq!(ask(&final_lib, &host.device, &b, name_b), Source::Library);
         assert_eq!(final_lib.read().unwrap().added.load(Ordering::Relaxed), 0);
+
+        // Save while `.bin` refuses rename (`.next` fallback), then verify
+        // `new_generation` adopts `.next`, maps `previous`, trims it, and
+        // preserves `.names` matching on WARP.
+        let c = kernel(&host.device, 7);
+        let name_c = "33333333333333333333333333333333";
+        assert_eq!(ask(&final_lib, &host.device, &c, name_c), Source::Made);
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 1;
+            let _lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&p.library)
+                .unwrap();
+            assert_eq!(
+                write_library(&final_lib, &p, true, |_| Ok(true)),
+                Saved::Written
+            );
+            assert!(p.next().exists());
+        }
+        drop(final_lib);
+
+        let blob = Blob::open(&p);
+        assert!(!p.next().exists());
+        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        let text = std::fs::read_to_string(&p.names).unwrap();
+        let rebuilt = RwLock::new(new_generation(&device, blob, Some(&text)).unwrap());
+        if let Some((at, len)) = rebuilt.read().unwrap().mapped_view() {
+            // SAFETY: `rebuilt` holds `previous._blob` alive until dropped below.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len);
+            }
+        }
+        assert_eq!(ask(&rebuilt, &host.device, &c, name_c), Source::Previous);
+        assert_eq!(ask(&rebuilt, &host.device, &c, name_c), Source::Library);
+        drop(rebuilt);
     }
 
     #[test]
     fn ram_idle_ms_scales_with_available_memory() {
         const GIB: u64 = 1024 * 1024 * 1024;
         assert_eq!(crate::host::ram_idle_ms(None), 10_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(0)), 2_000);
         assert_eq!(crate::host::ram_idle_ms(Some(GIB)), 2_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(2 * GIB - 1)), 2_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(2 * GIB)), 5_000);
         assert_eq!(crate::host::ram_idle_ms(Some(3 * GIB)), 5_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(4 * GIB - 1)), 5_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(4 * GIB)), 10_000);
         assert_eq!(crate::host::ram_idle_ms(Some(8 * GIB)), 10_000);
     }
 }
