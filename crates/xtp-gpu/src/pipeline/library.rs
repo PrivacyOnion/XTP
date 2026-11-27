@@ -82,10 +82,21 @@
 //!   that first finds such an entry makes the pipeline beside it and says
 //!   so in the names file, and the precooks after it count it no more.
 
+//! - The library file is mapped read-only rather than read into a heap buffer
+//!   ([`Blob`]): D3D12 reads the bytes for as long as the library lives, so
+//!   mapping keeps the file out of private commit and lets Windows reclaim clean
+//!   pages without pagefile I/O. The file handle stays open until the view is
+//!   unmapped so replacing the file by a rename never zeroes unpaged pages of
+//!   the old view; where a filesystem refuses to replace a mapped file, the save
+//!   writes `<id>.next` and the next open adopts it ([`adopt_next`]). Once loads
+//!   go idle, [`trim`] calls `VirtualUnlock` on the view to drop its pages from
+//!   the working set. `XTP_LIBRARY_MAP=0` reads into a buffer instead;
+//!   `XTP_LIBRARY_TRIM=0` skips working-set trimming.
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -116,10 +127,236 @@ pub(crate) static KNOWN: AtomicU64 = AtomicU64::new(0);
 static LOCK_US: AtomicU64 = AtomicU64::new(0);
 static LOAD_US: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the library file is mapped read-only on open ([`Blob::Mapped`]).
+/// On by default; `XTP_LIBRARY_MAP=0` reads the file into a heap buffer instead.
+fn mapped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_LIBRARY_MAP").is_none_or(|v| v != "0"))
+}
+
+/// A read-only view of a library file, unmapped on drop.
+///
+/// The file handle (`_file`) stays open until after `UnmapViewOfFile` runs in
+/// `Drop::drop`: replacing a mapped file by a rename while its handle is closed
+/// causes Windows to discard unpaged pages of the old file, which then read
+/// back as zeros when faulted in later.
+struct Mapped {
+    at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+    _file: Option<std::fs::File>,
+}
+
+// SAFETY: the read-only view and held file handle can be moved between threads.
+unsafe impl Send for Mapped {}
+// SAFETY: the mapping is read-only and never mutated through this handle.
+unsafe impl Sync for Mapped {}
+
+impl Mapped {
+    /// Maps `file` (`len` bytes, non-zero) read-only.
+    fn map(file: &std::fs::File, len: usize) -> Option<Mapped> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
+        };
+        if len == 0 || len > isize::MAX as usize {
+            return None;
+        }
+        // SAFETY: an unnamed read-only mapping over a live file handle.
+        let section = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            return None;
+        }
+        // SAFETY: CreateFileMappingW returned a valid handle owned by us.
+        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        // SAFETY: the section covers the whole file and permits read-only views of len bytes.
+        let at = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, len) };
+        (!at.Value.is_null()).then_some(Mapped {
+            at,
+            len,
+            _file: None,
+        })
+    }
+
+    /// Maps `path` read-only while holding its file handle open.
+    fn open(path: &Path) -> Option<Mapped> {
+        Mapped::open_holding(path, true)
+    }
+
+    /// Maps `path` read-only; `hold` controls whether the file handle stays open
+    /// until the view is unmapped.
+    fn open_holding(path: &Path, hold: bool) -> Option<Mapped> {
+        // Opened with standard Rust sharing (read, write, delete), so a save can
+        // rename a new library over this file while it remains mapped.
+        let file = std::fs::File::open(path).ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let mut mapped = Mapped::map(&file, len)?;
+        if hold {
+            mapped._file = Some(file);
+        }
+        Some(mapped)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the view holds len readable bytes until dropped.
+        unsafe { std::slice::from_raw_parts(self.at.Value.cast(), self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: this object owns the view and unmaps it once; _file drops afterwards.
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.at) };
+    }
+}
+
+/// The bytes a library is made from: the host reads them for as long as
+/// the library lives, so they are kept beside it.
+enum Blob {
+    /// No file (an empty library).
+    None,
+    /// Bytes held in memory (`XTP_LIBRARY_MAP=0`, tests, or a file that could
+    /// not be mapped).
+    Held(Vec<u8>),
+    /// The file itself, mapped read-only.
+    Mapped(Mapped),
+}
+
+impl Blob {
+    /// Opens the library file in `place`, adopting any pending `.next` file
+    /// first. Maps it read-only unless `XTP_LIBRARY_MAP=0` or mapping fails.
+    fn open(place: &Place) -> Blob {
+        adopt_next(place);
+        if mapped()
+            && let Some(file) = Mapped::open(&place.library)
+        {
+            return Blob::Mapped(file);
+        }
+        match std::fs::read(&place.library) {
+            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
+            _ => Blob::None,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Blob::None => &[],
+            Blob::Held(bytes) => bytes,
+            Blob::Mapped(file) => file.bytes(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+
+    fn mapped_view(&self) -> Option<(usize, usize)> {
+        match self {
+            Blob::Mapped(file) => Some((file.at.Value as usize, file.len)),
+            Blob::None | Blob::Held(_) => None,
+        }
+    }
+}
+
+/// The static library's mapped view (address, length; 0 when unmapped), when a
+/// pipeline was last looked up in the library (`crate::host::now_ms`), and
+/// whether the view has already been trimmed since that lookup.
+static VIEW: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+static LOADED_AT: AtomicU64 = AtomicU64::new(0);
+static TRIMMED: AtomicBool = AtomicBool::new(false);
+
+/// Records the static library's mapped view so [`trim`] can drop its pages
+/// from the working set once loads go idle. Must only be called for the
+/// process-lifetime library stored in [`library`].
+fn register_mapped_view(lib: &Library) {
+    let view = lib
+        ._blob
+        .mapped_view()
+        .or_else(|| lib.previous.as_ref().and_then(|g| g._blob.mapped_view()));
+    if let Some((at, len)) = view {
+        VIEW[1].store(len, Ordering::Relaxed);
+        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+        VIEW[0].store(at, Ordering::Release);
+    }
+}
+
+/// Notes that a library lookup touched the library bytes, resetting the idle
+/// trim timer.
+fn note_loaded() {
+    if VIEW[0].load(Ordering::Relaxed) != 0 {
+        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+        TRIMMED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Drops the mapped library file's pages from the process working set once no
+/// pipeline has been loaded for a few seconds (`crate::host::ram_idle_ms`).
+///
+/// Pages stay file-backed in Windows' standby list and fault back in if a
+/// pipeline is loaded later. Rate-limited to once a second and run on a
+/// short-lived background thread so callers never stall on page table walks.
+/// `XTP_LIBRARY_TRIM=0` disables trimming.
+pub(crate) fn trim() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    let at = VIEW[0].load(Ordering::Acquire);
+    if at == 0
+        || TRIMMED.load(Ordering::Relaxed)
+        || !*ON.get_or_init(|| std::env::var_os("XTP_LIBRARY_TRIM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let checked = CHECKED.load(Ordering::Relaxed);
+    if now < checked.saturating_add(1000)
+        || CHECKED
+            .compare_exchange(checked, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if now < LOADED_AT.load(Ordering::Relaxed).saturating_add(quiet_ms)
+        || TRIMMED.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    let len = VIEW[1].load(Ordering::Relaxed);
+    let work = move || {
+        // SAFETY: the view belongs to the static pipeline library and stays
+        // mapped for the rest of the process; unlocking unlocked pages is
+        // documented to fail and drop them from the working set.
+        unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
+        tracing::debug!(
+            bytes = len,
+            "host pipeline library view trimmed from working set"
+        );
+    };
+    if std::thread::Builder::new()
+        .name("xtp-library-trim".into())
+        .spawn(work)
+        .is_err()
+    {
+        TRIMMED.store(false, Ordering::Relaxed);
+    }
+}
+
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    _blob: Blob,
     /// Changes since the last save, including replacing a generation.
     added: AtomicU64,
     /// While a new generation is made ([`rebuild`]): the one before, read
@@ -141,7 +378,7 @@ struct Library {
 /// the names it holds if its names file was its own.
 struct Generation {
     library: ID3D12PipelineLibrary1,
-    _blob: Vec<u8>,
+    _blob: Blob,
     names: Option<Names>,
 }
 
@@ -150,7 +387,7 @@ impl Library {
     /// the names known to be in it.
     fn new(
         library: ID3D12PipelineLibrary1,
-        blob: Vec<u8>,
+        blob: Blob,
         names: Names,
         file: Option<FileId>,
         blob_is_file: bool,
@@ -480,6 +717,25 @@ impl Place {
             names: dir.join(NAMES_FILE),
         }
     }
+
+    /// Fallback path for a saved library when renaming over a mapped
+    /// [`Place::library`] fails; adopted on the next open ([`adopt_next`]).
+    fn next(&self) -> PathBuf {
+        self.library.with_extension("next")
+    }
+}
+
+/// Renames a pending `.next` library file over `place.library` if present.
+fn adopt_next(place: &Place) {
+    let next = place.next();
+    if next.exists()
+        && let Err(e) = std::fs::rename(&next, &place.library)
+    {
+        tracing::warn!(
+            error = %e,
+            "host pipeline library saved last could not take the old one's place"
+        );
+    }
 }
 
 /// The generations of the library, one per translation key, most recently
@@ -629,6 +885,7 @@ fn settle(dir: &Path, id: &str, kept: usize, budget: u64) -> std::io::Result<Set
     found.sort_unstable();
     list.extend(found.iter().map(|id| Lineage::own(id)));
     let place = Place::of(dir, id);
+    adopt_next(&place);
     let listed = list.iter().position(|g| g.id == id).map(|i| list.remove(i));
     let (lineage, new) = match listed {
         Some(lineage) if place.library.exists() => (lineage, false),
@@ -660,6 +917,7 @@ fn seed(dir: &Path, place: &Place, list: &[Lineage]) -> Option<String> {
     let _ = std::fs::remove_file(&place.names);
     for g in list {
         let from = Place::of(dir, &g.id);
+        adopt_next(&from);
         if !from.library.exists() {
             continue;
         }
@@ -683,6 +941,7 @@ fn seed(dir: &Path, place: &Place, list: &[Lineage]) -> Option<String> {
         }
     }
     let legacy = Place::legacy(dir);
+    adopt_next(&legacy);
     if legacy.library.exists() {
         match std::fs::rename(&legacy.library, &place.library) {
             Ok(()) => {
@@ -728,6 +987,7 @@ fn evict(dir: &Path, list: &mut Vec<Lineage>, kept: usize, budget: u64) -> Vec<S
         match std::fs::remove_file(&place.library) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&place.names);
+                let _ = std::fs::remove_file(place.next());
                 tracing::info!(
                     generation = g.id,
                     bytes,
@@ -824,9 +1084,7 @@ fn library() -> Option<&'static RwLock<Library>> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             // This translator's generation alone.
             let place = current().map(|s| &s.place);
-            let blob = place
-                .and_then(|p| std::fs::read(&p.library).ok())
-                .unwrap_or_default();
+            let blob = place.map_or(Blob::None, Blob::open);
             let names = place.and_then(|p| std::fs::read_to_string(&p.names).ok());
             let library = if REBUILD.load(Ordering::SeqCst) {
                 let library = new_generation(&device, blob, names.as_deref());
@@ -835,7 +1093,9 @@ fn library() -> Option<&'static RwLock<Library>> {
             } else {
                 open(&device, blob, names.as_deref())
             };
-            if library.is_none() {
+            if let Some(lib) = &library {
+                register_mapped_view(lib);
+            } else {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
             library.map(RwLock::new)
@@ -872,13 +1132,14 @@ fn make(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12Pip
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage), with the names `names` (the names
 /// file's text) says it holds if they are that blob's.
-fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: Blob, names: Option<&str>) -> Option<Library> {
     if !blob.is_empty() {
-        match make(device, &blob) {
+        match make(device, blob.bytes()) {
             Ok(library) => {
-                let read = names.and_then(|text| Names::read(text, &blob));
+                let read = names.and_then(|text| Names::read(text, blob.bytes()));
                 tracing::info!(
                     bytes = blob.len(),
+                    mapped = matches!(blob, Blob::Mapped(_)),
                     names = read.as_ref().map(|(n, _)| n.held.len()),
                     "host pipeline library loaded"
                 );
@@ -895,10 +1156,12 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Li
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
+    // Release any rejected mapping before creating the empty library.
+    drop(blob);
     let library = make(device, &[]).ok()?;
     Some(Library::new(
         library,
-        Vec::new(),
+        Blob::None,
         Names::empty(),
         None,
         false,
@@ -908,14 +1171,14 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Li
 
 /// An empty library, the one in `blob` its generation before (none if the
 /// host rejects it), with the names `names` says it holds.
-fn new_generation(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) -> Option<Library> {
+fn new_generation(device: &ID3D12Device1, blob: Blob, names: Option<&str>) -> Option<Library> {
     let previous = if blob.is_empty() {
         None
     } else {
-        match make(device, &blob) {
+        match make(device, blob.bytes()) {
             Ok(library) => Some(Generation {
                 names: names
-                    .and_then(|text| Names::read(text, &blob))
+                    .and_then(|text| Names::read(text, blob.bytes()))
                     .map(|(n, _)| n),
                 library,
                 _blob: blob,
@@ -928,10 +1191,13 @@ fn new_generation(device: &ID3D12Device1, blob: Vec<u8>, names: Option<&str>) ->
     };
     tracing::info!(
         before = previous.as_ref().map_or(0, |g| g._blob.len()),
+        mapped = previous
+            .as_ref()
+            .is_some_and(|g| matches!(g._blob, Blob::Mapped(_))),
         "host pipeline library: a new generation, from the one before"
     );
     let library = make(device, &[]).ok()?;
-    let library = Library::new(library, Vec::new(), Names::empty(), None, false, previous);
+    let library = Library::new(library, Blob::None, Names::empty(), None, false, previous);
     // Even a generation with no surviving pipelines replaces its file.
     library.added.store(1, Ordering::Relaxed);
     Some(library)
@@ -1034,8 +1300,10 @@ fn found_in(
         let (_name, l) = take();
         let started = std::time::Instant::now();
         let mut loaded = None;
+        let mut touched = false;
         let ours = tried(Some(&l.names()));
         for k in ours {
+            touched = true;
             match load(&l.library, PCWSTR(slots[k].1.as_ptr())) {
                 Ok(pso) => {
                     // Learned, when the names were not all known, and
@@ -1054,12 +1322,16 @@ fn found_in(
             && let Some(previous) = &l.previous
         {
             for k in tried(previous.names.as_ref()) {
+                touched = true;
                 if let Ok(pso) = load(&previous.library, PCWSTR(slots[k].1.as_ptr())) {
                     l.store(&slots, &failed, &pso);
                     loaded = Some((pso, Source::Previous));
                     break;
                 }
             }
+        }
+        if touched {
+            note_loaded();
         }
         LOAD_US.fetch_add(since(started), Ordering::Relaxed);
         loaded
@@ -1261,7 +1533,7 @@ fn write_library(
         let file =
             FileId::of(unsafe { std::slice::from_raw_parts(mapped.view.Value.cast(), size) });
         drop(mapped);
-        std::fs::rename(&tmp, path)?;
+        replace_library(place, &tmp)?;
         write_names(library, place, &names, Some(file));
         Ok(Some((size, added)))
     })();
@@ -1299,7 +1571,7 @@ fn write_names(library: &RwLock<Library>, place: &Place, names: &Names, file: Op
         if file.is_some() {
             *known = file;
         } else if known.is_none() && l.blob_is_file {
-            *known = Some(FileId::of(&l._blob));
+            *known = Some(FileId::of(l._blob.bytes()));
         }
         *known
     };
@@ -1398,6 +1670,29 @@ impl Drop for LibraryFile {
     }
 }
 
+/// Renames the written library `tmp` over `place.library`. Windows 11 allows
+/// renaming over a mapped file, and our mapping keeps reading the old contents
+/// while its file handle stays open ([`Mapped`]). Where a filesystem refuses
+/// to replace a mapped file, the new library is left beside it as `.next` and
+/// adopted on the next open ([`adopt_next`]). Returns whether the file was
+/// replaced in place.
+fn replace_library(place: &Place, tmp: &Path) -> std::io::Result<bool> {
+    match std::fs::rename(tmp, &place.library) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(place.next());
+            Ok(true)
+        }
+        Err(_) => {
+            std::fs::rename(tmp, place.next())?;
+            tracing::debug!(
+                next = %place.next().display(),
+                "host pipeline library left as .next for the next open"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part. One save at a time uses it
 /// ([`save`]).
@@ -1476,7 +1771,12 @@ mod tests {
         let device = gpu.device.cast::<ID3D12Device1>().expect("ID3D12Device1");
         // The layer reports the blob it cannot read; the library falls back.
         let library = crate::testgpu::expect_layer_errors(|| {
-            open(&device, b"not a pipeline library".repeat(16), None).expect("an empty library")
+            open(
+                &device,
+                Blob::Held(b"not a pipeline library".repeat(16)),
+                None,
+            )
+            .expect("an empty library")
         });
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
@@ -1603,7 +1903,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Blob::None, None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         // A file where the folder should be.
@@ -1653,7 +1953,7 @@ mod tests {
         };
         let host = gpu.host();
         let device = host.device.cast::<ID3D12Device1>().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Blob::None, None).unwrap());
         library.read().unwrap().added.store(2, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         let (inside, go) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
@@ -1704,7 +2004,7 @@ mod tests {
             );
             std::fs::read(place(dir.path()).library).unwrap()
         };
-        let old = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let old = RwLock::new(open(&device, Blob::None, None).unwrap());
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Made);
         assert_eq!(ask(&old, &host.device, &b, "b"), Source::Made);
         // Even a matching name must not return a pipeline whose
@@ -1712,18 +2012,18 @@ mod tests {
         let mismatch = crate::testgpu::expect_layer_errors(|| ask(&old, &host.device, &b, "a"));
         assert_eq!(mismatch, Source::Made);
         assert_eq!(ask(&old, &host.device, &a, "a"), Source::Library);
-        let new = RwLock::new(new_generation(&device, saved(&old), None).unwrap());
+        let new = RwLock::new(new_generation(&device, Blob::Held(saved(&old)), None).unwrap());
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Previous);
         assert_eq!(ask(&new, &host.device, &a, "a"), Source::Library);
-        let next = RwLock::new(open(&device, saved(&new), None).unwrap());
+        let next = RwLock::new(open(&device, Blob::Held(saved(&new)), None).unwrap());
         assert_eq!(ask(&next, &host.device, &a, "a"), Source::Library);
         assert_eq!(
             ask(&next, &host.device, &b, "b"),
             Source::Made,
             "not asked for"
         );
-        let empty = RwLock::new(new_generation(&device, saved(&next), None).unwrap());
-        let reopened = RwLock::new(open(&device, saved(&empty), None).unwrap());
+        let empty = RwLock::new(new_generation(&device, Blob::Held(saved(&next)), None).unwrap());
+        let reopened = RwLock::new(open(&device, Blob::Held(saved(&empty)), None).unwrap());
         assert_eq!(
             ask(&reopened, &host.device, &a, "a"),
             Source::Made,
@@ -1806,7 +2106,7 @@ mod tests {
         let device = host.device.cast::<ID3D12Device1>().unwrap();
         let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
         let name = "00112233445566778899aabbccddeeff";
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Blob::None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
         let other =
             || crate::testgpu::expect_layer_errors(|| ask(&library, &host.device, &b, name));
@@ -1825,7 +2125,7 @@ mod tests {
         let blob = std::fs::read(place(dir.path()).library).unwrap();
         let text = std::fs::read_to_string(place(dir.path()).names).unwrap();
         assert_eq!(Names::read(&text, &blob), Some((held, FileId::of(&blob))));
-        let reopened = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let reopened = RwLock::new(open(&device, Blob::Held(blob), Some(&text)).unwrap());
         let other =
             || crate::testgpu::expect_layer_errors(|| ask(&reopened, &host.device, &b, name));
         assert_eq!(other(), Source::Library, "repaired for the next process");
@@ -1854,7 +2154,7 @@ mod tests {
             "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
         );
         let dir = tempfile::tempdir().unwrap();
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Blob::None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name_a), Source::Made);
         assert_eq!(
             write_library(&library, &place(dir.path()), true, |_| Ok(true)),
@@ -1867,7 +2167,7 @@ mod tests {
         // count is the process's: other tests' precooks, the replay's,
         // may add to it meanwhile. `Source::Known` says this ask's.)
         let known = KNOWN.load(Ordering::Relaxed);
-        let named = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let named = RwLock::new(open(&device, Blob::Held(blob.clone()), Some(&text)).unwrap());
         assert_eq!(
             without_loading(|| ask(&named, &host.device, &a, name_a)),
             Source::Known
@@ -1884,7 +2184,7 @@ mod tests {
         );
 
         // Read without its names (an older file): loaded once, then known.
-        let unnamed = RwLock::new(open(&device, blob, None).unwrap());
+        let unnamed = RwLock::new(open(&device, Blob::Held(blob), None).unwrap());
         assert_eq!(
             without_loading(|| ask(&unnamed, &host.device, &a, name_a)),
             Source::Library
@@ -1934,13 +2234,13 @@ mod tests {
             (blob, text)
         };
         // The library's entry of the name is another description's.
-        let library = RwLock::new(open(&device, Vec::new(), None).unwrap());
+        let library = RwLock::new(open(&device, Blob::None, None).unwrap());
         assert_eq!(ask(&library, &host.device, &a, name), Source::Made);
         let (blob, text) = saved(&library);
 
         // A session's load of `b` by that name fails, and its compile too
         // (nothing goes under the next name): the names file says broken.
-        let session = RwLock::new(open(&device, blob.clone(), Some(&text)).unwrap());
+        let session = RwLock::new(open(&device, Blob::Held(blob.clone()), Some(&text)).unwrap());
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a copy of a live root signature, not released by the
             // description.
@@ -1968,7 +2268,7 @@ mod tests {
 
         // The precook does not answer by it: it loads, then makes `b`,
         // under the next name.
-        let precook = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let precook = RwLock::new(open(&device, Blob::Held(blob), Some(&text)).unwrap());
         let made = crate::testgpu::expect_layer_errors(|| {
             without_loading(|| ask(&precook, &host.device, &b, name))
         });
@@ -1990,7 +2290,7 @@ mod tests {
 
         // A session after it loads `b` by the next name; `a` still loads
         // by its own, which mends it.
-        let next = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        let next = RwLock::new(open(&device, Blob::Held(blob), Some(&text)).unwrap());
         let found = crate::testgpu::expect_layer_errors(|| ask(&next, &host.device, &b, name));
         assert_eq!(found, Source::Library);
         assert_eq!(ask(&next, &host.device, &a, name), Source::Library);
@@ -2241,5 +2541,192 @@ mod tests {
         let a = settle(d, A, 10, u64::MAX).unwrap();
         assert_eq!(a.lineage, Lineage::own(A));
         assert_eq!(ids(&read_generations(d)), [A, E]);
+    }
+
+    /// A mapped library file reads back as written, survives replacement while
+    /// mapped, and adopts `.next` on the next open if a rename over the live
+    /// file is refused.
+    #[test]
+    fn the_library_file_is_mapped_and_replaced() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = place(dir.path());
+        assert!(matches!(Blob::open(&p), Blob::None), "no file yet");
+        std::fs::write(&p.library, b"").unwrap();
+        assert!(matches!(Blob::open(&p), Blob::None), "an empty file");
+
+        let old: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        std::fs::write(&p.library, &old).unwrap();
+        let blob = Blob::open(&p);
+        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        assert_eq!(blob.bytes(), &old[..]);
+
+        // Replace while the old file is mapped.
+        let tmp = p.library.with_extension("tmp");
+        let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+        std::fs::write(&tmp, &new).unwrap();
+        replace_library(&p, &tmp).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(blob.bytes(), &old[..]);
+        drop(blob);
+
+        assert_eq!(Blob::open(&p).bytes(), &new[..]);
+        assert!(!p.next().exists());
+
+        // When rename over the live file is refused (no FILE_SHARE_DELETE),
+        // the save falls back to `.next` and the next open adopts it.
+        const FILE_SHARE_READ: u32 = 1;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&p.library)
+            .unwrap();
+        let newer: Vec<u8> = (0..150_000u32).map(|i| (i * 13) as u8).collect();
+        std::fs::write(&tmp, &newer).unwrap();
+        assert!(!replace_library(&p, &tmp).unwrap());
+        assert!(p.next().exists());
+        drop(lock);
+
+        let adopted = Blob::open(&p);
+        assert_eq!(adopted.bytes(), &newer[..]);
+        assert!(!p.next().exists());
+    }
+
+    fn pattern(at: usize, out: &mut [u8]) {
+        for (i, word) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = ((at / 4 + i) as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(1);
+            *word = v.to_le_bytes();
+        }
+    }
+
+    /// Writes `len` bytes (whole MiB) of [`pattern`] past the system cache so
+    /// no page starts resident. Returns false if the filesystem rejects it.
+    fn write_uncached(path: &Path, len: usize) -> bool {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
+        const UNCACHED: u32 = 0x2000_0000 | 0x8000_0000;
+        const CHUNK: usize = 1 << 20;
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(UNCACHED)
+            .open(path)
+        else {
+            return false;
+        };
+        let mut store = vec![0u8; CHUNK + 4096];
+        let start = store.as_ptr().align_offset(4096);
+        for at in (0..len).step_by(CHUNK) {
+            let chunk = &mut store[start..start + CHUNK];
+            pattern(at, chunk);
+            if file.write_all(chunk).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Replacing a mapped library file and trimming its view with
+    /// `VirtualUnlock` still reads back the original bytes when the file
+    /// handle is held open.
+    #[test]
+    fn a_replaced_library_file_still_reads_from_the_disk() {
+        const LEN: usize = 8 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let p = place(dir.path());
+        if !write_uncached(&p.library, LEN) {
+            return;
+        }
+        let mapped = Mapped::open_holding(&p.library, true).expect("mapped library file");
+        let tmp = p.library.with_extension("tmp");
+        std::fs::write(&tmp, vec![0xEE; LEN]).unwrap();
+        replace_library(&p, &tmp).unwrap();
+        // SAFETY: `mapped` owns this view until it drops at the end of the test.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualUnlock(
+                mapped.at.Value as *const _,
+                mapped.len,
+            )
+        };
+        let mut expected = vec![0u8; 4096];
+        for (page, bytes) in mapped.bytes().chunks(4096).enumerate() {
+            pattern(page * 4096, &mut expected);
+            assert_eq!(
+                bytes,
+                &expected[..],
+                "page {page} of the replaced library no longer reads as the old file"
+            );
+        }
+    }
+
+    /// A library round-trips through save, read-only mapping, save over the
+    /// mapped file, and `VirtualUnlock` trim on WARP.
+    #[test]
+    fn mapped_library_round_trips_on_warp() {
+        let test = "pipeline::library::tests::mapped_library_round_trips_on_warp";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let device = host.device.cast::<ID3D12Device1>().unwrap();
+        let (a, b) = (kernel(&host.device, 3), kernel(&host.device, 5));
+        let (name_a, name_b) = (
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = place(dir.path());
+
+        let initial = RwLock::new(open(&device, Blob::None, None).unwrap());
+        assert_eq!(ask(&initial, &host.device, &a, name_a), Source::Made);
+        assert_eq!(
+            write_library(&initial, &p, true, |_| Ok(true)),
+            Saved::Written
+        );
+
+        let blob = Blob::open(&p);
+        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        let text = std::fs::read_to_string(&p.names).unwrap();
+        let reopened = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        assert_eq!(ask(&reopened, &host.device, &a, name_a), Source::Library);
+
+        // Save a second pipeline over the mapped file and trim the view.
+        assert_eq!(ask(&reopened, &host.device, &b, name_b), Source::Made);
+        assert_eq!(
+            write_library(&reopened, &p, true, |_| Ok(true)),
+            Saved::Written
+        );
+        if let Some((at, len)) = reopened.read().unwrap()._blob.mapped_view() {
+            // SAFETY: `reopened` holds this mapped view alive until dropped below.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len);
+            }
+        }
+        assert_eq!(ask(&reopened, &host.device, &a, name_a), Source::Library);
+        assert_eq!(ask(&reopened, &host.device, &b, name_b), Source::Library);
+        drop(reopened);
+
+        // Reopen from disk and verify both pipelines load from the mapped library.
+        let blob = Blob::open(&p);
+        assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
+        let text = std::fs::read_to_string(&p.names).unwrap();
+        let final_lib = RwLock::new(open(&device, blob, Some(&text)).unwrap());
+        assert_eq!(ask(&final_lib, &host.device, &a, name_a), Source::Library);
+        assert_eq!(ask(&final_lib, &host.device, &b, name_b), Source::Library);
+        assert_eq!(final_lib.read().unwrap().added.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ram_idle_ms_scales_with_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(crate::host::ram_idle_ms(None), 10_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(GIB)), 2_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(3 * GIB)), 5_000);
+        assert_eq!(crate::host::ram_idle_ms(Some(8 * GIB)), 10_000);
     }
 }
