@@ -2731,6 +2731,7 @@ impl State {
         use crate::descriptor::host::{fits, srv_desc, uav_desc};
         use windows::Win32::Graphics::Dxgi::Common::*;
 
+        let role = program.role;
         let entry = |(slot, offset): crate::ambient::Binding, kind| {
             if offset % 8 != 0
                 || !used.iter().any(|u| {
@@ -2740,29 +2741,45 @@ impl State {
                         && u.table_offset_dwords == offset
                 })
             {
-                return None;
+                return ambient_refused(role, &format!("table {slot} entry {offset}: not used so"));
             }
             let Some(&Root::Table(table)) = self.compute.get(usize::from(slot)) else {
-                return None;
+                return ambient_refused(role, &format!("root {slot} is not a table"));
             };
             let address = table + u64::from(offset) * 4;
-            let heap = self.heap_of(address)?;
+            let heap = self
+                .heap_of(address)
+                .or_else(|| ambient_refused(role, &format!("table {slot}: no heap")))?;
             if self.host_heaps[0] != std::ptr::from_ref(heap) as usize {
-                return None;
+                return ambient_refused(role, &format!("table {slot}: not the bound heap"));
             }
-            let host = heap.host()?;
+            let host = heap
+                .host()
+                .or_else(|| ambient_refused(role, &format!("table {slot}: no host heap")))?;
             let index = match made.iter().find(|(root, _)| *root == slot) {
                 Some(&(_, base)) => ((base & !(xtp_shader::emit::REMAPPED_SLOT << 5)) / 32)
                     .checked_add(offset / 8)?,
-                None => heap.index(address)?,
+                None => heap
+                    .index(address)
+                    .or_else(|| ambient_refused(role, &format!("table {slot}: no index")))?,
             };
-            let view = crate::descriptor::view(address)?;
+            let view = crate::descriptor::view(address).or_else(|| {
+                ambient_refused(role, &format!("table {slot} entry {offset}: no view"))
+            })?;
             let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
-            let resource = host.kept_resource(index)?;
+            let resource = host.kept_resource(index).or_else(|| {
+                ambient_refused(
+                    role,
+                    &format!(
+                        "table {slot} entry {offset}: nothing kept at {index} (made {})",
+                        made.iter().any(|(root, _)| *root == slot)
+                    ),
+                )
+            })?;
             // SAFETY: the descriptor's resource is retained; desc is returned by value.
             let desc = unsafe { resource.GetDesc() };
             if desc.SampleDesc.Count != 1 {
-                return None;
+                return ambient_refused(role, "multisampled");
             }
             Some((
                 Texture {
@@ -2779,17 +2796,24 @@ impl State {
             Role::Air => program.layout.air,
         };
         let (image, View::Unordered(_, _, words), desc) = entry(slot, ResourceType::Uav)? else {
-            return None;
+            return ambient_refused(role, "the image is not an unordered view");
         };
         let expected = match program.role {
             Role::Resolve => DXGI_FORMAT_R32_UINT,
             Role::Radiance | Role::Air => DXGI_FORMAT_R11G11B10_FLOAT,
         };
         let mut view = words.as_ref().map(uav_desc);
-        if !fits(&image.resource, view.as_mut().map(|v| &mut v.Format), true)
-            || view.as_ref().map_or(desc.Format, |v| v.Format) != expected
-        {
-            return None;
+        let fit = fits(&image.resource, view.as_mut().map(|v| &mut v.Format), true);
+        if !fit || view.as_ref().map_or(desc.Format, |v| v.Format) != expected {
+            return ambient_refused(
+                role,
+                &format!(
+                    "image format: resource {} view {:?} fits {fit}, expected {}",
+                    desc.Format.0,
+                    view.as_ref().map(|v| v.Format.0),
+                    expected.0
+                ),
+            );
         }
         let volume = program.role == Role::Air;
         let shape_ok = if volume {
@@ -2817,20 +2841,32 @@ impl State {
                 })
         };
         if !shape_ok {
-            return None;
+            return ambient_refused(
+                role,
+                &format!(
+                    "image shape: dimension {} depth {}",
+                    desc.Dimension.0, desc.DepthOrArraySize
+                ),
+            );
         }
-        let depth = if program.role == Role::Resolve {
-            let (depth, View::Shader(resource, words), depth_desc) =
-                entry(program.layout.depth, ResourceType::Srv)?
+        // The resolve's depth: the layout's entry if it is a single-sample
+        // depth view of the light's size, else the first other shader view
+        // of the dispatch's tables that is (its tables also hold a stencil
+        // view of the same target in some builds).
+        let depth_at = |at: crate::ambient::Binding| -> Option<Texture> {
+            let (depth, View::Shader(resource, words), depth_desc) = entry(at, ResourceType::Srv)?
             else {
-                return None;
+                return ambient_refused(role, "the depth is not a shader view");
             };
             let mut view = words
                 .as_ref()
                 .map(srv_desc)
                 .or_else(|| crate::resource::whole_typed_view(resource as This));
             if !fits(&depth.resource, view.as_mut().map(|v| &mut v.Format), false) {
-                return None;
+                return ambient_refused(
+                    role,
+                    &format!("depth view does not fit resource {}", depth_desc.Format.0),
+                );
             }
             let format = view.as_ref().map_or(depth_desc.Format, |v| v.Format);
             if !matches!(
@@ -2851,7 +2887,44 @@ impl State {
                         }
                 })
             {
-                return None;
+                return ambient_refused(
+                    role,
+                    &format!(
+                        "depth: format {} dimension {} depth {} size {}x{} vs light {}x{}",
+                        format.0,
+                        depth_desc.Dimension.0,
+                        depth_desc.DepthOrArraySize,
+                        depth_desc.Width,
+                        depth_desc.Height,
+                        desc.Width,
+                        desc.Height
+                    ),
+                );
+            }
+            Some(depth)
+        };
+        let depth = if program.role == Role::Resolve {
+            let preferred = program.layout.depth;
+            let others = used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                .map(|u| (u.slot, u.table_offset_dwords))
+                .filter(|&at| at != preferred);
+            let Some((at, depth)) = std::iter::once(preferred)
+                .chain(others)
+                .find_map(|at| depth_at(at).map(|depth| (at, depth)))
+            else {
+                return ambient_refused(role, "no depth view among the dispatch's tables");
+            };
+            if at != preferred {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        slot = at.0,
+                        offset = at.1,
+                        "ambient depth taken from another table entry"
+                    )
+                });
             }
             Some(depth)
         } else {
@@ -4298,6 +4371,20 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(windows)]
+/// Logs why the ambient pass could not take a dispatch's views, once per
+/// distinct reason (up to 32), and gives nothing.
+fn ambient_refused<T>(role: crate::ambient::Role, reason: &str) -> Option<T> {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let key = format!("{role:?} {reason}");
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 32 && !seen.contains(&key) {
+        tracing::warn!(?role, reason, "ambient views refused");
+        seen.push(key);
+    }
+    None
 }
 
 #[cfg(test)]

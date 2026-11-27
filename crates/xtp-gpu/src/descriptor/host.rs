@@ -843,7 +843,6 @@ impl KeptSlots {
             .and_then(|slot| std::mem::replace(slot, resource))
     }
 
-    #[cfg(test)]
     fn get(&self, index: u32) -> Option<ID3D12Resource> {
         let idx = index as usize;
         let shard = self.shards[idx % self.shards.len()]
@@ -2367,11 +2366,7 @@ impl HostHeap {
     /// The actual resource of a host descriptor, including a freshly
     /// remapped or placed view. Null descriptors have no resource.
     pub(crate) fn kept_resource(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)?
-            .clone()
+        self.kept.get(index)
     }
 
     /// [`HostHeap::keep`], handing back the resource the slot held.
