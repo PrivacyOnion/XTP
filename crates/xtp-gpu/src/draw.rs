@@ -161,6 +161,8 @@ pub(crate) struct State {
     /// its submission, not found when it was bound ([`State::bind_tlas`]):
     /// the title's view of it and the TLAS's root parameter.
     tlas_at_submission: Option<(u64, u32)>,
+    /// Validated host views for a post-dispatch ambient pass, if needed.
+    ambient: Option<crate::ambient::Bound>,
     /// The title's graphics and compute root signatures, for
     /// [`State::set_root_signature`].
     title_roots: [usize; 2],
@@ -1509,6 +1511,7 @@ impl State {
         limits: [u32; 3],
     ) -> Result<(), &'static str> {
         self.tlas_at_submission = None;
+        self.ambient = None;
         #[cfg(feature = "diagnostics")]
         list.twin_reader(&p.name);
         // Depth planes whose twins shaders of the list wrote are drawn
@@ -1603,6 +1606,12 @@ impl State {
                 self.host_roots[1] = 0;
                 self.host_pipeline = 0;
                 self.bind_pipeline(list, p, compute);
+            }
+            if compute && let Some(program) = stage.shader.ambient {
+                self.ambient = self.ambient_views(program, &t.used, &made);
+                if self.ambient.is_none() {
+                    once!(hash = %stage.shader.hash, role = ?program.role, "ambient views unavailable");
+                }
             }
             let mut biases = Vec::new();
             for &(slot, param) in &stage.root_uavs {
@@ -2698,8 +2707,166 @@ impl State {
             });
         };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if ![x, y, z].contains(&0)
+            && let Some(bound) = self.ambient.take()
+            && crate::ambient::after(list, &bound)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         #[cfg(feature = "diagnostics")]
         meshes.ran();
+    }
+
+    /// Finds the exact descriptors used by the dispatch, including tables
+    /// remapped into the heap's dynamic slots. Only the expected view kinds
+    /// and base subresources can be used by the ambient passes.
+    fn ambient_views(
+        &self,
+        program: crate::ambient::Program,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+    ) -> Option<crate::ambient::Bound> {
+        use crate::ambient::{Bound, Role, Texture};
+        use crate::descriptor::host::{fits, srv_desc, uav_desc};
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let entry = |(slot, offset): crate::ambient::Binding, kind| {
+            if offset % 8 != 0
+                || !used.iter().any(|u| {
+                    u.slot == slot
+                        && u.root == RootType::Table
+                        && u.kind == kind
+                        && u.table_offset_dwords == offset
+                })
+            {
+                return None;
+            }
+            let Some(&Root::Table(table)) = self.compute.get(usize::from(slot)) else {
+                return None;
+            };
+            let address = table + u64::from(offset) * 4;
+            let heap = self.heap_of(address)?;
+            if self.host_heaps[0] != std::ptr::from_ref(heap) as usize {
+                return None;
+            }
+            let host = heap.host()?;
+            let index = match made.iter().find(|(root, _)| *root == slot) {
+                Some(&(_, base)) => ((base & !(xtp_shader::emit::REMAPPED_SLOT << 5)) / 32)
+                    .checked_add(offset / 8)?,
+                None => heap.index(address)?,
+            };
+            let view = crate::descriptor::view(address)?;
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            let resource = host.kept_resource(index)?;
+            // SAFETY: the descriptor's resource is retained; desc is returned by value.
+            let desc = unsafe { resource.GetDesc() };
+            if desc.SampleDesc.Count != 1 {
+                return None;
+            }
+            Some((
+                Texture {
+                    handle: host.gpu_handle(index),
+                    resource,
+                },
+                view,
+                desc,
+            ))
+        };
+        let slot = match program.role {
+            Role::Resolve => program.layout.light,
+            Role::Radiance => program.layout.radiance,
+            Role::Air => program.layout.air,
+        };
+        let (image, View::Unordered(_, _, words), desc) = entry(slot, ResourceType::Uav)? else {
+            return None;
+        };
+        let expected = match program.role {
+            Role::Resolve => DXGI_FORMAT_R32_UINT,
+            Role::Radiance | Role::Air => DXGI_FORMAT_R11G11B10_FLOAT,
+        };
+        let mut view = words.as_ref().map(uav_desc);
+        if !fits(&image.resource, view.as_mut().map(|v| &mut v.Format), true)
+            || view.as_ref().map_or(desc.Format, |v| v.Format) != expected
+        {
+            return None;
+        }
+        let volume = program.role == Role::Air;
+        let shape_ok = if volume {
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                && view.is_none_or(|v| {
+                    if v.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE3D {
+                        return false;
+                    }
+                    // SAFETY: the view dimension selects Texture3D.
+                    let v = unsafe { v.Anonymous.Texture3D };
+                    v.MipSlice == 0
+                        && v.FirstWSlice == 0
+                        && (v.WSize == u32::MAX || v.WSize == u32::from(desc.DepthOrArraySize))
+                })
+        } else {
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && desc.DepthOrArraySize == 1
+                && view.is_none_or(|v| {
+                    // SAFETY: the dimension check selects Texture2D.
+                    v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D
+                        && unsafe {
+                            v.Anonymous.Texture2D.MipSlice == 0
+                                && v.Anonymous.Texture2D.PlaneSlice == 0
+                        }
+                })
+        };
+        if !shape_ok {
+            return None;
+        }
+        let depth = if program.role == Role::Resolve {
+            let (depth, View::Shader(resource, words), depth_desc) =
+                entry(program.layout.depth, ResourceType::Srv)?
+            else {
+                return None;
+            };
+            let mut view = words
+                .as_ref()
+                .map(srv_desc)
+                .or_else(|| crate::resource::whole_typed_view(resource as This));
+            if !fits(&depth.resource, view.as_mut().map(|v| &mut v.Format), false) {
+                return None;
+            }
+            let format = view.as_ref().map_or(depth_desc.Format, |v| v.Format);
+            if !matches!(
+                format,
+                DXGI_FORMAT_R32_FLOAT
+                    | DXGI_FORMAT_R16_UNORM
+                    | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+                    | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+            ) || depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || depth_desc.DepthOrArraySize != 1
+                || (depth_desc.Width, depth_desc.Height) != (desc.Width, desc.Height)
+                || view.is_some_and(|v| {
+                    // SAFETY: the dimension check selects Texture2D.
+                    v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                        || unsafe {
+                            v.Anonymous.Texture2D.MostDetailedMip != 0
+                                || v.Anonymous.Texture2D.PlaneSlice != 0
+                        }
+                })
+            {
+                return None;
+            }
+            Some(depth)
+        } else {
+            None
+        };
+        Some(Bound {
+            role: program.role,
+            image,
+            depth,
+            size: [
+                u32::try_from(desc.Width).ok()?,
+                desc.Height,
+                u32::from(desc.DepthOrArraySize),
+            ],
+        })
     }
 
     /// Counts a dispatch that does not run; the next one of the list that
