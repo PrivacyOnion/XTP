@@ -71,6 +71,21 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Acquires a reference while the caller prevents destruction, without
+/// reviving an object whose final release has already started.
+///
+/// # Safety
+/// The caller must keep the object allocated through this call.
+#[cfg(windows)]
+pub(crate) unsafe fn try_add_ref(this: This) -> bool {
+    // SAFETY: the caller keeps the object allocated until this returns.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        if n == 0 { None } else { n.checked_add(1) }
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -129,10 +144,17 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_with::<T>(this, || {})
+}
+
+/// As [`release_boxed`], with a callback to invalidate borrowed addresses
+/// before taking exclusive ownership of the allocation.
+pub(crate) fn release_boxed_with<T>(this: This, before_drop: impl FnOnce()) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            before_drop();
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
