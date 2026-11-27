@@ -12,10 +12,14 @@
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
 //! so a list of thousands of garbage records cannot run for seconds
-//! either. One group charges it in record order (VIctory #1510): the first
-//! record that does not fit, and every record after it in the list, run
-//! empty. A word that every thread adds to wraps once enough rejected
-//! records have charged it, and lets work in again.
+//! either. One group charges it in record order (VIctory #1510): by
+//! default a record that does not fit runs empty and leaves the remaining
+//! budget for later records that do fit, so one oversized record does not
+//! empty the rest of the list. Setting `XTP_INDIRECT_REST=1` restores the
+//! earlier behaviour where the first record that does not fit spends the
+//! rest of the budget and every record after it in the list runs empty.
+//! A word that every thread adds to wraps once enough rejected records
+//! have charged it, and lets work in again.
 //!
 //! shortcut: one group walks every record, 64 at a time, so the clamp's
 //! time grows with the records a title passes (43 ms for 2^20 records on
@@ -126,7 +130,9 @@ void main(uint lane : SV_GroupIndex) {
                 for (uint i = 0; i < n; i++) {
                     starts[i] = written;
                     if (costs[i] > left) {
+#if REST
                         left = 0;
+#endif
                         costs[i] = 0xffffffff;
                         if (measure) InterlockedAdd(metrics[6], 1);
                     } else {
@@ -327,28 +333,47 @@ unsafe impl Send for Clamp {}
 // SAFETY: as above.
 unsafe impl Sync for Clamp {}
 
-fn clamp() -> Option<&'static Clamp> {
-    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
-    CLAMP
-        .get_or_init(|| match make() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
-                None
-            }
-        })
-        .as_ref()
+/// Whether a record that does not fit in the list's remaining budget spends
+/// the rest of it so every later record in the list runs empty too
+/// (`XTP_INDIRECT_REST=1`; off by default so one oversized record runs empty
+/// and later records that fit still run).
+fn rest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rest_from(std::env::var_os("XTP_INDIRECT_REST").as_deref()))
 }
 
-fn make() -> windows::core::Result<Clamp> {
+fn rest_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+fn clamp_for(take_rest: bool) -> Option<&'static Clamp> {
+    static DEFAULT: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    static TAKE_REST: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    let slot = if take_rest { &TAKE_REST } else { &DEFAULT };
+    slot.get_or_init(|| match make(take_rest) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+            None
+        }
+    })
+    .as_ref()
+}
+
+fn make(take_rest: bool) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let source = format!("#define REST {}\n{SOURCE}", u32::from(take_rest));
+    compile_compute(device, &source)
+}
+
+fn compile_compute(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -581,12 +606,24 @@ fn window(buffer: &ID3D12Resource, offset: u64, bytes: u32) -> Option<(u64, u32)
 /// Une écriture intermédiaire sur l’une des deux entrées ouvre une nouvelle série.
 pub(crate) fn bound(
     list: &HostList,
-    (buffer, offset): (&ID3D12Resource, u64),
-    (kind, stride, records): (u32, u32, u32),
+    args: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
     count: Option<(&ID3D12Resource, u64)>,
     stats: Option<(u64, u32)>,
     writes: Writes,
     output: Output,
+) -> Option<Bounded> {
+    bound_with(list, args, spec, count, stats, (writes, output), rest())
+}
+
+fn bound_with(
+    list: &HostList,
+    (buffer, offset): (&ID3D12Resource, u64),
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<(&ID3D12Resource, u64)>,
+    stats: Option<(u64, u32)>,
+    (writes, output): (Writes, Output),
+    take_rest: bool,
 ) -> Option<Bounded> {
     let min_stride = match kind {
         0 => 16,
@@ -651,7 +688,7 @@ pub(crate) fn bound(
             false
         }
         _ => {
-            let c = clamp()?;
+            let c = clamp_for(take_rest)?;
             let budget = list.budget()?;
             let (table, data) = list.scratch(16 + RUN_LENGTH as u64 * 32)?;
             let mut run = Run {
@@ -869,14 +906,25 @@ mod tests {
         (result, data)
     }
 
-    /// The clamp compiles with the system's compiler and the host takes it.
+    /// Both clamp variants compile with the system's compiler and the host takes them.
     #[test]
     fn argument_clamp_builds() {
         let test = "indirect::tests::argument_clamp_builds";
         let Some(_gpu) = crate::testgpu::device(test) else {
             return;
         };
-        assert!(super::clamp().is_some());
+        assert!(super::clamp_for(false).is_some());
+        assert!(super::clamp_for(true).is_some());
+    }
+
+    #[test]
+    fn rest_switch_only_enables_on_one() {
+        use std::ffi::OsStr;
+        assert!(!rest_from(None));
+        assert!(!rest_from(Some(OsStr::new(""))));
+        assert!(!rest_from(Some(OsStr::new("0"))));
+        assert!(!rest_from(Some(OsStr::new("true"))));
+        assert!(rest_from(Some(OsStr::new("1"))));
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,
@@ -884,6 +932,17 @@ mod tests {
     /// it ran empty). One more record follows them and must stay as
     /// written. `None` without a host GPU (`test`'s skip is reported).
     fn clamped(test: &str, kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        clamped_mode(test, kind, words, records, calls, false)
+    }
+
+    fn clamped_mode(
+        test: &str,
+        kind: u32,
+        words: &[u32],
+        records: u32,
+        calls: u32,
+        take_rest: bool,
+    ) -> Option<Vec<u32>> {
         let gpu = crate::testgpu::device(test)?;
         let host = gpu.host();
         // Words in a record of `kind`.
@@ -906,14 +965,14 @@ mod tests {
         }
         let mut commands = None;
         for _ in 0..calls {
-            commands = super::bound(
+            commands = super::bound_with(
                 &list,
                 (&buffer, 0),
                 spec,
                 None,
                 None,
-                Writes::default(),
-                Output::Draw,
+                (Writes::default(), Output::Draw),
+                take_rest,
             );
             assert!(commands.is_some());
         }
@@ -1015,19 +1074,171 @@ mod tests {
         assert!(small.iter().all(|&count| count == 1));
     }
 
-    /// A record that does not fit ends the budget: after two draws of
-    /// 3 * 2^24 vertex instances a third takes what is left, and the small
-    /// ones after it run empty.
+    /// By default a record that does not fit runs empty and leaves the
+    /// remaining budget for later records that fit; with `XTP_INDIRECT_REST=1`
+    /// it spends the rest so later records run empty too.
     #[test]
-    fn a_record_that_does_not_fit_ends_the_budget() {
-        let test = "indirect::tests::a_record_that_does_not_fit_ends_the_budget";
+    fn a_record_that_does_not_fit_leaves_the_budget_by_default() {
+        let test = "indirect::tests::a_record_that_does_not_fit_leaves_the_budget_by_default";
         let mut words = [1 << 24, 3, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
         let Some(draws) = clamped(test, 0, &words, 8, 1) else {
             return;
         };
         let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
-        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+        assert_eq!(ran, [true, true, false, true, true, true, true, true]);
+        let rest_draws = clamped_mode(test, 0, &words, 8, 1, true).expect("a host GPU");
+        let rest_ran: Vec<bool> = rest_draws.iter().map(|&count| count != 0).collect();
+        assert_eq!(
+            rest_ran,
+            [true, true, false, false, false, false, false, false]
+        );
+    }
+
+    /// One list of indirect compute dispatches where an early record exceeds
+    /// the remaining budget and later small records fit: by default the later
+    /// records run (writing their marker), budget rejections are still counted,
+    /// and a later >65,535-group record still chunks; with `XTP_INDIRECT_REST=1`
+    /// every later record runs empty.
+    #[test]
+    fn oversized_indirect_dispatch_leaves_budget_for_later_record() {
+        const MARKER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer marker : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint prev;
+    marker.InterlockedAdd(0, 1, prev);
+}
+"#;
+        let test = "indirect::tests::oversized_indirect_dispatch_leaves_budget_for_later_record";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let worker =
+            compile_compute(&host.device, MARKER_CS).expect("marker compute shader must compile");
+        let signature = crate::draw::host_signature(2, 12).expect("native dispatch signature");
+
+        // Six 12-byte dispatch records:
+        // 0: 65,535 * 24 = 1,572,840 groups (100,661,760 threads), leaving 33,555,968 threads.
+        // 1: 40,000 * 14 = 560,000 groups (35,840,000 threads) -> over remaining budget.
+        // 2: (1, 1, 1) -> 64 threads -> fits and writes +1 to marker.
+        // 3: 40,000 * 14 -> second over-budget record -> counted in past_budget.
+        // 4: (2, 1, 1) -> 128 threads -> fits and writes +2 to marker.
+        // 5: (70,000, 1, 1) -> 4,480,000 threads -> fits and splits into 65,535 + 4,465.
+        let records: [[u32; 3]; 6] = [
+            [65_535, 24, 1],
+            [40_000, 14, 1],
+            [1, 1, 1],
+            [40_000, 14, 1],
+            [2, 1, 1],
+            [70_000, 1, 1],
+        ];
+        let initial_cost = 65_535 * 24 * 64;
+
+        for take_rest in [false, true] {
+            let list = host.new_list().expect("a host list");
+            let (args, args_data) = host.shared_buffer(6 * 12).expect("args buffer");
+            let (stats, stats_data) = host.shared_buffer(3 * 64).expect("stats buffer");
+            let (marker, marker_data) = host.shared_buffer(4).expect("marker buffer");
+            // SAFETY: mapped buffers owned by this test until after `host.drain()`.
+            let (stats_gpu, marker_gpu) = unsafe {
+                std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), args_data, 6 * 12);
+                std::ptr::write_bytes(stats_data, 0, 3 * 64);
+                marker_data.cast::<u32>().write_volatile(0);
+                (stats.GetGPUVirtualAddress(), marker.GetGPUVirtualAddress())
+            };
+
+            let first = bound_with(
+                &list,
+                (&args, 0),
+                (2, 12, 1),
+                None,
+                Some((stats_gpu, 0)),
+                (Writes::default(), Output::Native),
+                take_rest,
+            )
+            .expect("initial budget spend bounded");
+            let second = bound_with(
+                &list,
+                (&args, 12),
+                (2, 12, 4),
+                None,
+                Some((stats_gpu, 64)),
+                (Writes::default(), Output::Native),
+                take_rest,
+            )
+            .expect("mixed records bounded");
+            let third = bound_with(
+                &list,
+                (&args, 60),
+                (2, 12, 1),
+                None,
+                Some((stats_gpu, 128)),
+                (Writes::default(), Output::Expanded),
+                take_rest,
+            )
+            .expect("chunked record bounded");
+            assert!(first.dispatched && !second.dispatched && !third.dispatched);
+
+            let (_chunked_buf, chunked_data) = read_commands(&list, &third, 4 + 2 * 24);
+            list.keep(&signature);
+            // SAFETY: open command list, live pipeline and buffers; `second.buffer` is
+            // in `INDIRECT_ARGUMENT` and `marker` promotes from `COMMON` to `UAV`.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, marker_gpu);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    second.capacity,
+                    &second.buffer,
+                    second.offset + 4,
+                    &second.buffer,
+                    second.offset,
+                );
+            }
+
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+
+            // SAFETY: GPU execution finished; buffers are still live and mapped.
+            unsafe {
+                let hits = marker_data.cast::<u32>().read_volatile();
+                let s = stats_data.cast::<u32>();
+                let second_past_budget = s.add(16 + 6).read_volatile();
+                let second_spent = s.add(16 + 13).read_volatile();
+                let third_past_budget = s.add(32 + 6).read_volatile();
+                let third_spent = s.add(32 + 13).read_volatile();
+                let third_split = s.add(32 + 15).read_volatile();
+                let chunk_count = chunked_data.cast::<u32>().read_volatile();
+                if take_rest {
+                    assert_eq!(
+                        hits, 0,
+                        "later dispatches must not run with XTP_INDIRECT_REST=1"
+                    );
+                    assert_eq!(second_past_budget, 4);
+                    assert_eq!(second_spent, 1 << 27);
+                    assert_eq!(third_past_budget, 1);
+                    assert_eq!(third_spent, 1 << 27);
+                    assert_eq!(third_split, 0);
+                    assert_eq!(chunk_count, 0);
+                } else {
+                    assert_eq!(hits, 3, "later small dispatches must run by default");
+                    assert_eq!(second_past_budget, 2);
+                    assert_eq!(second_spent, initial_cost + 3 * 64);
+                    assert_eq!(third_past_budget, 0);
+                    assert_eq!(third_spent, initial_cost + 3 * 64 + 70_000 * 64);
+                    assert_eq!(third_split, 1);
+                    assert_eq!(chunk_count, 2);
+                    let pieces = std::slice::from_raw_parts(chunked_data.cast::<u32>().add(1), 12);
+                    assert_eq!(pieces, [0, 0, 0, 65_535, 1, 1, 65_535, 0, 0, 4_465, 1, 1]);
+                }
+            }
+        }
     }
 
     /// The budget is the list's: a second execution of the same records
