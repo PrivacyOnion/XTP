@@ -16,6 +16,8 @@
 //! `present` (swap chain). In tests, `testgpu` gives GPU tests the host
 //! device (hardware, or WARP with `XTP_TEST_ADAPTER=warp`).
 
+#[cfg(windows)]
+pub mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
